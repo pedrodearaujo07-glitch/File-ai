@@ -1,0 +1,48 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+
+      # pubspec.yaml e lib/ já existem no repo, então isso só gera as pastas
+      # de plataforma que faltam (android/, etc.) sem mexer no que já temos.
+      - name: Gerar esqueleto Android
+        run: flutter create --platforms=android --org com.pedrohenrique --project-name voice_file_ai .
+
+      - name: Aplicar arquivos nativos personalizados
+        run: |
+          cp -r android_overlay/app/src/main/kotlin/. android/app/src/main/kotlin/
+
+      - name: Adicionar permissões no AndroidManifest.xml
+        run: |
+          sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.RECORD_AUDIO"\/>\n    <uses-permission android:name="android.permission.INTERNET"\/>#' android/app/src/main/AndroidManifest.xml
+          grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+
+      - name: Adicionar dependência androidx.documentfile
+        run: |
+          sed -i "s#dependencies {#dependencies {\n    implementation 'androidx.documentfile:documentfile:1.0.1'#" android/app/build.gradle
+          grep -q documentfile android/app/build.gradle
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: Build APK (debug)
+        run: flutter build apk --debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-file-ai-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          
