@@ -32,7 +32,12 @@ jobs:
 
       - name: Adicionar dependência androidx.documentfile
         run: |
-          sed -i "s#dependencies {#dependencies {\n    implementation 'androidx.documentfile:documentfile:1.0.1'#" android/app/build.gradle
+          cat >> android/app/build.gradle << 'EOF'
+
+          dependencies {
+              implementation 'androidx.documentfile:documentfile:1.0.1'
+          }
+          EOF
           grep -q documentfile android/app/build.gradle
 
       - name: flutter pub get
@@ -45,4 +50,3 @@ jobs:
         with:
           name: voice-file-ai-debug-apk
           path: build/app/outputs/flutter-apk/app-debug.apk
-          
