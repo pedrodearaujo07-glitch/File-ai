@@ -34,6 +34,11 @@ class MainActivity : FlutterActivity() {
                 "deleteFile" -> deleteFile(call.argument("uri")!!, result)
                 "readFile" -> readFile(call.argument("uri")!!, result)
                 "writeFile" -> writeFile(call.argument("uri")!!, call.argument("content")!!, result)
+                "createFolder" -> createFolder(
+                    call.argument("parentTreeUri")!!,
+                    call.argument("name")!!,
+                    result,
+                )
                 "createFile" -> createFile(
                     call.argument("parentTreeUri")!!,
                     call.argument("name")!!,
@@ -164,6 +169,17 @@ class MainActivity : FlutterActivity() {
             result.success(true)
         } catch (e: Exception) {
             result.error("WRITE_FAILED", e.message, null)
+        }
+    }
+
+    private fun createFolder(parentTreeUriStr: String, name: String, result: Result) {
+        try {
+            val parentDir = DocumentFile.fromTreeUri(this, Uri.parse(parentTreeUriStr))
+            val newDir = parentDir?.createDirectory(name)
+            // null costuma significar que já existe algo com esse nome ali.
+            result.success(newDir?.uri?.toString())
+        } catch (e: Exception) {
+            result.error("CREATE_FOLDER_FAILED", e.message, null)
         }
     }
 
