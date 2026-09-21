@@ -80,7 +80,8 @@ class _HomePageState extends State<HomePage> {
       _addMessage(ChatSender.system, '⚠️ Configure sua chave do Gemini nas configurações (ícone no topo).');
       return null;
     }
-    _gemini = GeminiService(apiKey);
+    _gemini = GeminiService(apiKey)
+      ..onStatus = (message) => _addMessage(ChatSender.system, message);
     return _gemini;
   }
 
@@ -177,10 +178,15 @@ class _HomePageState extends State<HomePage> {
         final confirmed = action.needsConfirmation ? await _confirmAction(action) : true;
         var outcome = const ActionOutcome.fail();
         if (confirmed) {
-          _addMessage(ChatSender.system, '⚙️ ${action.describe()}');
+          _addMessage(ChatSender.system, '⚙️ ${action.summary}');
           outcome = await _executeAction(gemini, action);
           if (!outcome.success) {
-            _addMessage(ChatSender.system, '⚠️ ${outcome.error ?? 'Não consegui executar a ação.'}');
+            final failedItems = outcome.data?['falharam'];
+            final detail = failedItems is List && failedItems.isNotEmpty
+                ? '\nNão deu certo: ${failedItems.join(', ')}'
+                : '';
+            _addMessage(ChatSender.system,
+                '⚠️ ${outcome.error ?? 'Não consegui executar a ação.'}$detail');
           }
           if (!action.isReadOnly) await _refreshListing();
         }
@@ -196,7 +202,8 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } catch (e) {
-      _addMessage(ChatSender.system, '⚠️ Erro: $e');
+      final message = e.toString().replaceFirst('Exception: ', '');
+      _addMessage(ChatSender.system, '⚠️ Erro: $message');
     } finally {
       setState(() => _isBusy = false);
     }
@@ -207,7 +214,7 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Confirmar ação'),
-        content: Text(action.describe()),
+        content: SingleChildScrollView(child: Text(action.describe())),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -234,12 +241,12 @@ class _HomePageState extends State<HomePage> {
         case 'list_folder':
           return await _listFolder(gemini, input['uri'], input['recursive'] == true);
         case 'move_file':
-          return _fromBool(
-            await FileBridge.moveFile(
-              sourceUri: input['source_uri'],
+          return await _runBatch(
+            input['items'],
+            (item) => FileBridge.moveFile(
+              sourceUri: item['uri'],
               destTreeUri: input['dest_folder_uri'],
             ),
-            'Não consegui mover o arquivo.',
           );
         case 'rename_file':
           return _fromBool(
@@ -247,9 +254,9 @@ class _HomePageState extends State<HomePage> {
             'Não consegui renomear.',
           );
         case 'delete_file':
-          return _fromBool(
-            await FileBridge.deleteFile(input['uri']),
-            'Não consegui apagar.',
+          return await _runBatch(
+            input['items'],
+            (item) => FileBridge.deleteFile(item['uri']),
           );
         case 'read_file':
           return await _readFile(input['uri']);
@@ -277,6 +284,36 @@ class _HomePageState extends State<HomePage> {
 
   ActionOutcome _fromBool(bool ok, String failMessage) =>
       ok ? const ActionOutcome.ok() : ActionOutcome.fail(failMessage);
+
+  /// Roda a mesma operação em vários itens (uma confirmação só) e resume o
+  /// resultado: o que deu certo e o que falhou. Uma falha não impede os outros.
+  Future<ActionOutcome> _runBatch(
+    List<dynamic> items,
+    Future<bool> Function(Map<String, dynamic> item) operation,
+  ) async {
+    final done = <String>[];
+    final failed = <String>[];
+    for (final raw in items) {
+      final item = Map<String, dynamic>.from(raw as Map);
+      final name = '${item['name']}';
+      try {
+        if (await operation(item)) {
+          done.add(name);
+        } else {
+          failed.add(name);
+        }
+      } catch (_) {
+        failed.add(name);
+      }
+    }
+    if (failed.isEmpty) return ActionOutcome.ok({'concluidos': done});
+    return ActionOutcome.fail(
+      done.isEmpty
+          ? 'Não consegui executar a ação.'
+          : 'Só parte dos itens foi processada.',
+      {'concluidos': done, 'falharam': failed},
+    );
+  }
 
   /// Lê um arquivo de texto e devolve o conteúdo pro modelo (limitado, pra não
   /// estourar o contexto). Arquivos binários (imagens, zips) são recusados.
