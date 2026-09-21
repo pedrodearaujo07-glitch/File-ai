@@ -596,4 +596,45 @@ class GeminiService {
 
     final rawParts = (content['parts'] as List<dynamic>?) ?? [];
 
-    // 
+    // O app responde a uma ferramenta por vez. Se o modelo pediu várias de
+    // uma vez (ex.: listar BP e RP juntos), guardamos só a primeira no
+    // histórico — senão a API reclama que faltam respostas de ferramenta.
+    // Ele pede as outras no turno seguinte.
+    final keptParts = <dynamic>[];
+    var hasCall = false;
+    for (final part in rawParts) {
+      if (part is Map && part['functionCall'] != null) {
+        if (hasCall) continue;
+        hasCall = true;
+      }
+      keptParts.add(part);
+    }
+
+    if (keptParts.isEmpty) {
+      return GeminiTurn(text: 'O modelo não devolveu resposta.');
+    }
+
+    // Guarda o turno do modelo como veio (preserva campos como thought
+    // signatures, essenciais pro Gemini manter o contexto entre chamadas de
+    // ferramenta em turnos seguintes).
+    _history.add({...content, 'parts': keptParts});
+
+    String? text;
+    PlannedAction? action;
+
+    for (final part in keptParts) {
+      if (part['text'] != null) {
+        text = (text ?? '') + (part['text'] as String);
+      } else if (part['functionCall'] != null && action == null) {
+        final call = part['functionCall'] as Map<String, dynamic>;
+        action = _buildAction(
+          call['name'] as String,
+          Map<String, dynamic>.from(call['args'] as Map? ?? {}),
+          call['id'] as String?,
+        );
+      }
+    }
+
+    return GeminiTurn(text: text, action: action);
+  }
+}
