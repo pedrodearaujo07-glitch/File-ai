@@ -82,6 +82,8 @@ class PlannedAction {
         }
       case 'write_file':
         return 'Editar o conteúdo de "${input['name']}"';
+      case 'create_folder':
+        return 'Criar a pasta "${input['name']}" em "${input['parent_name']}"';
       case 'create_file':
         return 'Criar o arquivo "${input['name']}" em "${input['parent_name']}"';
       case 'read_file':
@@ -170,7 +172,7 @@ class GeminiService {
     _idsByUri[rootUri] = 0;
     _entriesById[0] = FileEntry(
       uri: rootUri,
-      name: _rootName(rootUri),
+      name: rootNameFromUri(rootUri),
       isDirectory: true,
     );
   }
@@ -188,8 +190,9 @@ class GeminiService {
     }
   }
 
-  /// Nome amigável da pasta principal, tirado do fim da URI da árvore.
-  static String _rootName(String treeUri) {
+  /// Nome amigável de uma pasta principal, tirado do fim da URI da árvore.
+  /// Público porque a tela principal usa isso ao avisar que a pasta mudou.
+  static String rootNameFromUri(String treeUri) {
     try {
       final afterTree = treeUri.split('/tree/').last.split('/document/').first;
       final decoded = Uri.decodeComponent(afterTree);
@@ -320,6 +323,27 @@ class GeminiService {
       },
     },
     {
+      'name': 'create_folder',
+      'description':
+          'Cria uma nova subpasta dentro de outra pasta — use para organizar '
+              'arquivos em novas categorias antes de mover arquivos pra dentro '
+              'dela com move_file.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'parent_id': {
+            'type': 'integer',
+            'description': 'id da pasta onde criar (0 = pasta principal)',
+          },
+          'name': {
+            'type': 'string',
+            'description': 'nome simples da nova pasta, sem "/"',
+          },
+        },
+        'required': ['parent_id', 'name'],
+      },
+    },
+    {
       'name': 'create_file',
       'description': 'Cria um novo arquivo de texto dentro de uma pasta.',
       'parameters': {
@@ -357,6 +381,11 @@ class GeminiService {
         'com id 0 e recursive=true mostra a árvore inteira). Nunca opine sobre '
         'o conteúdo de uma pasta sem listá-la antes. Para ler um arquivo de '
         'texto use read_file (não funciona em pastas). '
+        'Para organizar arquivos em categorias, use create_folder para criar '
+        'uma subpasta e depois move_file para mover os arquivos pra dentro dela. '
+        'Se a listagem da pasta principal mudar de um pedido para o outro, é '
+        'porque o usuário trocou de pasta pelo app — continue a conversa '
+        'normalmente, sem se apresentar de novo nem reiniciar do zero. '
         'Para apagar ou mover VÁRIOS arquivos, faça numa única chamada '
         'passando todos os ids de uma vez (o usuário confirma uma vez só) — '
         'não chame a ferramenta arquivo por arquivo. '
@@ -655,6 +684,28 @@ class GeminiService {
             input: {'uri': file.uri, 'name': file.name, 'content': content},
           );
         }
+      case 'create_folder':
+        {
+          final parent = entryFor('parent_id');
+          if (parent == null) return invalid(missing('parent_id'));
+          if (!parent.isDirectory) {
+            return invalid('"${parent.name}" não é uma pasta.');
+          }
+          final name = textArg('name')?.trim();
+          if (name == null || badName(name)) {
+            return invalid(
+                'name inválido: precisa ser um nome simples, sem "/".');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {
+              'parent_uri': parent.uri,
+              'parent_name': parent.name,
+              'name': name,
+            },
+          );
+        }
       case 'create_file':
         {
           final parent = entryFor('parent_id');
@@ -821,5 +872,3 @@ class GeminiService {
     return GeminiTurn(text: text, action: action);
   }
 }
-
-   
