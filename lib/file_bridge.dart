@@ -95,6 +95,19 @@ class FileBridge {
     return result ?? false;
   }
 
+  /// Cria uma pasta nova dentro de outra pasta. Retorna a URI da pasta
+  /// criada, ou null se falhar (ex.: já existe algo com esse nome ali).
+  static Future<String?> createFolder({
+    required String parentTreeUri,
+    required String name,
+  }) async {
+    final result = await _channel.invokeMethod<String>('createFolder', {
+      'parentTreeUri': parentTreeUri,
+      'name': name,
+    });
+    return result;
+  }
+
   /// Cria um arquivo novo dentro de uma pasta (árvore) com um nome e
   /// conteúdo inicial. Retorna a URI do arquivo criado, ou null se falhar.
   static Future<String?> createFile({
