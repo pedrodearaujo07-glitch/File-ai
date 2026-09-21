@@ -9,11 +9,19 @@ antes de executar.
 
 1. Você escolhe uma pasta pelo seletor do próprio Android (SAF). O app só
    consegue mexer no que estiver dentro dessa pasta.
-2. Aperta o botão de microfone, fala o comando, solta.
-3. O texto transcrito + a lista de arquivos da pasta vai pra API do Gemini
-   com as "ferramentas" disponíveis (mover, apagar, editar, etc.) descritas.
-4. O modelo devolve qual ação tomar. O app mostra um diálogo de confirmação
-   antes de executar de verdade.
+2. Conversa normalmente — por voz (botão "Falar") ou digitando — como um chat.
+   O app lembra da conversa inteira (não só do último comando), então dá pra
+   corrigir ou complementar um pedido ("não, na verdade renomeia também").
+3. Cada comando + a listagem atual da pasta vai pra API do Gemini com as
+   "ferramentas" disponíveis (mover, apagar, editar, etc.) descritas. O
+   modelo chama no máximo uma ferramenta por vez e espera o resultado antes
+   de sugerir a próxima.
+4. Antes de executar qualquer ação de verdade, aparece um diálogo de
+   confirmação. Depois de confirmar (ou cancelar), o resultado volta pro
+   modelo, que responde naturalmente no chat — tipo "Prontinho, movido!" ou
+   "Sem problemas, deixei como estava."
+5. Trocar de pasta começa uma conversa nova (as URIs da pasta anterior não
+   valem mais).
 
 ## Primeiros passos
 
@@ -53,9 +61,14 @@ no futuro, é só atualizar a constante `_model` em `lib/gemini_service.dart`.
   inteiro — não é uma edição parcial ainda).
 - Sem suporte a subpastas aninhadas na listagem (lista só o primeiro nível
   por enquanto).
+- Segurança contra loop: o app para sozinho depois de 4 ações encadeadas
+  num mesmo comando (evita gasto/ação em excesso se o modelo entrar em loop).
+- A conversa fica só na memória — fechar o app apaga o histórico do chat
+  (a pasta escolhida também precisa ser reselecionada).
 
 ## Próximos passos sugeridos
 
 - Navegar para dentro de subpastas.
 - Confirmação por voz também ("sim"/"não"), não só toque.
 - Histórico de comandos com "desfazer".
+- 
