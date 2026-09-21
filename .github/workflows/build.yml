@@ -13,7 +13,7 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.27.3'
           channel: 'stable'
 
       # pubspec.yaml e lib/ já existem no repo, então isso só gera as pastas
