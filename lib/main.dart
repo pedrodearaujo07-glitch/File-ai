@@ -31,6 +31,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final stt.SpeechToText _speech = stt.SpeechToText();
   final List<String> _log = [];
+  final TextEditingController _textController = TextEditingController();
 
   String? _folderUri;
   List<FileEntry> _folderListing = [];
@@ -89,6 +90,14 @@ class _HomePageState extends State<HomePage> {
     setState(() => _isListening = false);
     if (_transcript.trim().isEmpty) return;
     await _runCommand(_transcript.trim());
+  }
+
+  Future<void> _submitTypedCommand() async {
+    final command = _textController.text.trim();
+    if (command.isEmpty) return;
+    _textController.clear();
+    FocusScope.of(context).unfocus();
+    await _runCommand(command);
   }
 
   Future<void> _runCommand(String command) async {
@@ -227,6 +236,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   @override
+  void dispose() {
+    _textController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
@@ -278,7 +293,32 @@ class _HomePageState extends State<HomePage> {
             ),
           if (_isBusy) const LinearProgressIndicator(),
           Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    enabled: !_isBusy,
+                    decoration: const InputDecoration(
+                      hintText: 'Ou digite um comando...',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _submitTypedCommand(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: _isBusy ? null : _submitTypedCommand,
+                  icon: const Icon(Icons.send),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
             child: FloatingActionButton.large(
               onPressed: _isBusy
                   ? null
