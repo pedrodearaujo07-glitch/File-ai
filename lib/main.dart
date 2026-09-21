@@ -48,6 +48,9 @@ class _HomePageState extends State<HomePage> {
   bool _isBusy = false;
   String _transcript = '';
 
+  /// Segurança contra loop: máximo de ações encadeadas por comando.
+  static const int _maxChainedActions = 12;
+
   void _addMessage(ChatSender sender, String text) {
     setState(() => _messages.insert(0, ChatMessage(sender, text)));
   }
@@ -142,7 +145,7 @@ class _HomePageState extends State<HomePage> {
         currentFolderListing: _folderListing,
       );
 
-      var chainGuard = 0;
+      var steps = 0;
       while (true) {
         if (turn.text != null && turn.text!.trim().isNotEmpty) {
           _addMessage(ChatSender.assistant, turn.text!.trim());
@@ -151,24 +154,43 @@ class _HomePageState extends State<HomePage> {
         final action = turn.action;
         if (action == null) break;
 
-        chainGuard++;
-        if (chainGuard > 4) {
+        steps++;
+        if (steps > _maxChainedActions) {
           _addMessage(ChatSender.system, '⚠️ Muitas ações em sequência — parando por segurança.');
           break;
         }
 
-        final confirmed = await _confirmAction(action);
-        var success = false;
+        // Pedido inválido do modelo (id que não existe etc.): devolve o erro
+        // pra ele se corrigir, sem incomodar o usuário com confirmação.
+        if (action.error != null) {
+          turn = await gemini.reportActionResult(
+            action: action,
+            success: false,
+            cancelledByUser: false,
+            error: action.error,
+            currentFolderUri: _folderUri!,
+            currentFolderListing: _folderListing,
+          );
+          continue;
+        }
+
+        final confirmed = action.needsConfirmation ? await _confirmAction(action) : true;
+        var outcome = const ActionOutcome.fail();
         if (confirmed) {
           _addMessage(ChatSender.system, '⚙️ ${action.describe()}');
-          success = await _executeAction(action);
-          await _refreshListing();
+          outcome = await _executeAction(gemini, action);
+          if (!outcome.success) {
+            _addMessage(ChatSender.system, '⚠️ ${outcome.error ?? 'Não consegui executar a ação.'}');
+          }
+          if (!action.isReadOnly) await _refreshListing();
         }
 
         turn = await gemini.reportActionResult(
           action: action,
-          success: success,
+          success: confirmed && outcome.success,
           cancelledByUser: !confirmed,
+          data: outcome.data,
+          error: outcome.error,
           currentFolderUri: _folderUri!,
           currentFolderListing: _folderListing,
         );
@@ -201,36 +223,125 @@ class _HomePageState extends State<HomePage> {
     return confirmed ?? false;
   }
 
-  Future<bool> _executeAction(PlannedAction action) async {
+  /// Executa a ação e devolve o resultado, inclusive os dados que o modelo
+  /// precisa ver (listagem de uma pasta, conteúdo de um arquivo). Nunca lança:
+  /// qualquer erro vira um ActionOutcome.fail, pra sempre voltar pro modelo
+  /// (senão o histórico da conversa fica com uma chamada sem resposta).
+  Future<ActionOutcome> _executeAction(GeminiService gemini, PlannedAction action) async {
     final input = action.input;
-    switch (action.toolName) {
-      case 'move_file':
-        return FileBridge.moveFile(
-          sourceUri: input['source_uri'],
-          destTreeUri: input['dest_folder_uri'],
-        );
-      case 'rename_file':
-        return FileBridge.renameFile(uri: input['uri'], newName: input['new_name']);
-      case 'delete_file':
-        return FileBridge.deleteFile(input['uri']);
-      case 'read_file':
-        final content = await FileBridge.readFile(input['uri']);
-        if (content != null) {
-          _addMessage(ChatSender.system, '📄 $content');
-        }
-        return content != null;
-      case 'write_file':
-        return FileBridge.writeFile(uri: input['uri'], content: input['content']);
-      case 'create_file':
-        final newUri = await FileBridge.createFile(
-          parentTreeUri: input['parent_uri'],
-          name: input['name'],
-          content: input['content'],
-        );
-        return newUri != null;
-      default:
-        return false;
+    try {
+      switch (action.toolName) {
+        case 'list_folder':
+          return await _listFolder(gemini, input['uri'], input['recursive'] == true);
+        case 'move_file':
+          return _fromBool(
+            await FileBridge.moveFile(
+              sourceUri: input['source_uri'],
+              destTreeUri: input['dest_folder_uri'],
+            ),
+            'Não consegui mover o arquivo.',
+          );
+        case 'rename_file':
+          return _fromBool(
+            await FileBridge.renameFile(uri: input['uri'], newName: input['new_name']),
+            'Não consegui renomear.',
+          );
+        case 'delete_file':
+          return _fromBool(
+            await FileBridge.deleteFile(input['uri']),
+            'Não consegui apagar.',
+          );
+        case 'read_file':
+          return await _readFile(input['uri']);
+        case 'write_file':
+          return _fromBool(
+            await FileBridge.writeFile(uri: input['uri'], content: input['content']),
+            'Não consegui gravar o arquivo.',
+          );
+        case 'create_file':
+          {
+            final newUri = await FileBridge.createFile(
+              parentTreeUri: input['parent_uri'],
+              name: input['name'],
+              content: input['content'],
+            );
+            return _fromBool(newUri != null, 'Não consegui criar o arquivo.');
+          }
+        default:
+          return ActionOutcome.fail('Ferramenta desconhecida: ${action.toolName}');
+      }
+    } catch (e) {
+      return ActionOutcome.fail('$e');
     }
+  }
+
+  ActionOutcome _fromBool(bool ok, String failMessage) =>
+      ok ? const ActionOutcome.ok() : ActionOutcome.fail(failMessage);
+
+  /// Lê um arquivo de texto e devolve o conteúdo pro modelo (limitado, pra não
+  /// estourar o contexto). Arquivos binários (imagens, zips) são recusados.
+  Future<ActionOutcome> _readFile(String uri) async {
+    const maxChars = 20000;
+    final content = await FileBridge.readFile(uri);
+    if (content == null) {
+      return const ActionOutcome.fail('Não consegui ler o arquivo.');
+    }
+    if (content.contains('\u0000')) {
+      return const ActionOutcome.fail(
+          'Esse arquivo parece binário (imagem, zip...), não é texto.');
+    }
+    final preview = content.length > 600 ? '${content.substring(0, 600)}…' : content;
+    _addMessage(ChatSender.system, '📄 $preview');
+    final truncated = content.length > maxChars;
+    return ActionOutcome.ok({
+      'conteudo': truncated ? content.substring(0, maxChars) : content,
+      if (truncated) 'aviso': 'Arquivo cortado nos primeiros $maxChars caracteres.',
+    });
+  }
+
+  /// Lista uma pasta (e, se `recursive`, tudo dentro das subpastas) num texto
+  /// indentado com o id de cada item — é isso que o modelo enxerga.
+  Future<ActionOutcome> _listFolder(GeminiService gemini, String uri, bool recursive) async {
+    const maxEntries = 400;
+    const maxDepth = 6;
+    final lines = <String>[];
+    var truncated = false;
+
+    Future<void> walk(String folderUri, int depth) async {
+      final entries = await FileBridge.listFiles(folderUri);
+      entries.sort((a, b) {
+        if (a.isDirectory != b.isDirectory) return a.isDirectory ? -1 : 1;
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
+      for (final e in entries) {
+        if (lines.length >= maxEntries) {
+          truncated = true;
+          return;
+        }
+        lines.add(gemini.formatEntry(e, depth: depth));
+        if (recursive && e.isDirectory) {
+          if (depth + 1 >= maxDepth) {
+            truncated = true;
+          } else {
+            await walk(e.uri, depth + 1);
+            if (truncated && lines.length >= maxEntries) return;
+          }
+        }
+      }
+    }
+
+    try {
+      await walk(uri, 0);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui listar a pasta: $e');
+    }
+
+    return ActionOutcome.ok({
+      'itens': lines.isEmpty ? '(pasta vazia)' : lines.join('\n'),
+      if (truncated)
+        'aviso': 'Listagem cortada (limite de $maxEntries itens / $maxDepth níveis). '
+            'Liste subpastas específicas para ver o resto.',
+    });
   }
 
   Future<void> _openSettings() async {
