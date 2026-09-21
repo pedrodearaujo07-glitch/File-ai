@@ -58,13 +58,49 @@ class _HomePageState extends State<HomePage> {
   Future<void> _pickFolder() async {
     final uri = await FileBridge.pickFolder();
     if (uri == null) return;
-    setState(() {
-      _folderUri = uri;
-      _messages.clear();
-    });
-    _gemini?.resetConversation();
+    final isFirstFolder = _folderUri == null;
+    setState(() => _folderUri = uri);
     await _refreshListing();
-    _addMessage(ChatSender.system, '📂 Pasta selecionada. Conversa reiniciada.');
+    // A conversa e os ids conhecidos continuam os mesmos — só a pasta que a
+    // IA enxerga como "principal" muda. Isso evita a sensação de estar
+    // falando com uma IA diferente a cada troca de pasta.
+    _addMessage(
+      ChatSender.system,
+      isFirstFolder
+          ? '📂 Pasta selecionada: "${GeminiService.rootNameFromUri(uri)}".'
+          : '📂 Pasta principal alterada para "${GeminiService.rootNameFromUri(uri)}".',
+    );
+  }
+
+  /// Apaga o histórico da conversa (a IA esquece o que foi dito), sem afetar
+  /// os arquivos. Diferente de trocar de pasta, isso é sempre uma escolha
+  /// explícita do usuário.
+  Future<void> _startNewConversation() async {
+    if (_messages.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Começar conversa nova?'),
+            content: const Text(
+                'A IA vai esquecer tudo que foi conversado até agora. Os '
+                'arquivos não são afetados.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancelar'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Começar de novo'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+    if (!confirmed) return;
+    _gemini?.resetConversation();
+    setState(() => _messages.clear());
+    _addMessage(ChatSender.system, '🔄 Conversa reiniciada.');
   }
 
   Future<void> _refreshListing() async {
@@ -265,6 +301,15 @@ class _HomePageState extends State<HomePage> {
             await FileBridge.writeFile(uri: input['uri'], content: input['content']),
             'Não consegui gravar o arquivo.',
           );
+        case 'create_folder':
+          {
+            final newUri = await FileBridge.createFolder(
+              parentTreeUri: input['parent_uri'],
+              name: input['name'],
+            );
+            return _fromBool(newUri != null,
+                'Não consegui criar a pasta (talvez já exista algo com esse nome ali).');
+          }
         case 'create_file':
           {
             final newUri = await FileBridge.createFile(
@@ -474,6 +519,11 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('Voice File AI'),
         actions: [
+          IconButton(
+            onPressed: _startNewConversation,
+            icon: const Icon(Icons.restart_alt),
+            tooltip: 'Começar conversa nova',
+          ),
           IconButton(onPressed: _openSettings, icon: const Icon(Icons.settings)),
         ],
       ),
