@@ -7,8 +7,9 @@ import 'file_bridge.dart';
 class PlannedAction {
   final String toolName;
   final Map<String, dynamic> input;
+  final String? callId;
 
-  PlannedAction({required this.toolName, required this.input});
+  PlannedAction({required this.toolName, required this.input, this.callId});
 
   /// Descrição em português para mostrar na confirmação antes de executar.
   String describe() {
@@ -31,8 +32,20 @@ class PlannedAction {
   }
 }
 
+/// O que o modelo devolveu num turno: uma fala (para mostrar no chat) e/ou
+/// uma ação a confirmar antes de executar.
+class GeminiTurn {
+  final String? text;
+  final PlannedAction? action;
+  GeminiTurn({this.text, this.action});
+}
+
 /// Usa a API do Gemini (Google), que tem um tier gratuito permanente.
 /// Chave grátis em https://aistudio.google.com/apikey — sem cartão.
+///
+/// Mantém o histórico da conversa internamente, então dá pra usar como um
+/// chat normal: o modelo lembra do que foi dito e do que já foi executado
+/// nos turnos anteriores.
 class GeminiService {
   static const _model = 'gemini-3.1-flash-lite';
   static const _endpoint =
@@ -40,6 +53,12 @@ class GeminiService {
 
   final String apiKey;
   GeminiService(this.apiKey);
+
+  final List<Map<String, dynamic>> _history = [];
+
+  /// Começa uma conversa nova (usado, por exemplo, quando o usuário troca de
+  /// pasta — as URIs antigas deixam de fazer sentido).
+  void resetConversation() => _history.clear();
 
   static final List<Map<String, dynamic>> _functionDeclarations = [
     {
@@ -121,25 +140,69 @@ class GeminiService {
     },
   ];
 
-  /// Manda o comando transcrito + a listagem atual da pasta para o modelo,
-  /// e devolve a ação planejada (ou null se o modelo só respondeu texto,
-  /// por exemplo pedindo mais informação).
-  Future<({PlannedAction? action, String? message})> interpretCommand({
-    required String transcript,
+  String _systemPrompt(String currentFolderUri, List<FileEntry> listing) {
+    final listingText = listing
+        .map((e) => '- ${e.isDirectory ? "[pasta]" : "[arquivo]"} ${e.name} (uri: ${e.uri})')
+        .join('\n');
+    return 'Você é um assistente que conversa naturalmente com o usuário e '
+        'controla arquivos no celular dele através de ferramentas. Responda '
+        'sempre em português do Brasil, de forma breve e natural, como num chat. '
+        'A pasta atual (uri: $currentFolderUri) contém:\n$listingText\n\n'
+        'Use SEMPRE as URIs exatas mostradas acima ao chamar uma ferramenta. '
+        'Chame no máximo UMA ferramenta por vez — se o pedido do usuário exigir '
+        'várias ações, execute a primeira e espere o resultado antes de propor '
+        'a próxima. Se o comando for ambíguo ou faltar informação, responda só '
+        'com texto perguntando o que precisa, em vez de chamar uma ferramenta.';
+  }
+
+  /// Manda uma mensagem do usuário (por voz ou digitada) e devolve o que o
+  /// modelo respondeu.
+  Future<GeminiTurn> sendUserMessage({
+    required String text,
     required String currentFolderUri,
     required List<FileEntry> currentFolderListing,
   }) async {
-    final listingText = currentFolderListing
-        .map((e) => '- ${e.isDirectory ? "[pasta]" : "[arquivo]"} ${e.name} (uri: ${e.uri})')
-        .join('\n');
+    _history.add({
+      'role': 'user',
+      'parts': [
+        {'text': text}
+      ],
+    });
+    return _callModel(currentFolderUri, currentFolderListing);
+  }
 
-    final systemPrompt =
-        'Você controla arquivos no celular do usuário através de ferramentas. '
-        'A pasta atual (uri: $currentFolderUri) contém:\n$listingText\n\n'
-        'Use SEMPRE as URIs exatas mostradas acima ao chamar uma ferramenta. '
-        'Se o comando for ambíguo ou faltar informação, responda só com texto '
-        'perguntando o que precisa, em vez de chamar uma ferramenta.';
+  /// Conta pro modelo o resultado de uma ação que acabou de ser executada
+  /// (ou cancelada pelo usuário), e devolve a resposta natural dele.
+  Future<GeminiTurn> reportActionResult({
+    required PlannedAction action,
+    required bool success,
+    required bool cancelledByUser,
+    required String currentFolderUri,
+    required List<FileEntry> currentFolderListing,
+  }) async {
+    final Map<String, dynamic> responseBody = cancelledByUser
+        ? {'error': 'O usuário cancelou essa ação antes de executar.'}
+        : {'success': success, if (!success) 'error': 'Falha ao executar a ação.'};
 
+    _history.add({
+      'role': 'user',
+      'parts': [
+        {
+          'functionResponse': {
+            if (action.callId != null) 'id': action.callId,
+            'name': action.toolName,
+            'response': responseBody,
+          }
+        }
+      ],
+    });
+    return _callModel(currentFolderUri, currentFolderListing);
+  }
+
+  Future<GeminiTurn> _callModel(
+    String currentFolderUri,
+    List<FileEntry> currentFolderListing,
+  ) async {
     final response = await http.post(
       Uri.parse(_endpoint),
       headers: {
@@ -149,17 +212,10 @@ class GeminiService {
       body: jsonEncode({
         'systemInstruction': {
           'parts': [
-            {'text': systemPrompt}
+            {'text': _systemPrompt(currentFolderUri, currentFolderListing)}
           ]
         },
-        'contents': [
-          {
-            'role': 'user',
-            'parts': [
-              {'text': transcript}
-            ]
-          }
-        ],
+        'contents': _history,
         'tools': [
           {'functionDeclarations': _functionDeclarations}
         ],
@@ -173,26 +229,37 @@ class GeminiService {
     final data = jsonDecode(utf8.decode(response.bodyBytes));
     final candidates = data['candidates'] as List<dynamic>?;
     if (candidates == null || candidates.isEmpty) {
-      return (action: null, message: 'O modelo não devolveu resposta.');
+      return GeminiTurn(text: 'O modelo não devolveu resposta.');
     }
 
-    final parts = candidates[0]['content']?['parts'] as List<dynamic>? ?? [];
+    final content = candidates[0]['content'] as Map<String, dynamic>?;
+    if (content == null) {
+      return GeminiTurn(text: 'O modelo não devolveu resposta.');
+    }
 
-    String? message;
+    // Guarda o turno do modelo exatamente como veio (preserva campos como
+    // thought signatures, essenciais pro Gemini manter o contexto entre
+    // chamadas de ferramenta em turnos seguintes).
+    _history.add(content);
+
+    final parts = content['parts'] as List<dynamic>? ?? [];
+
+    String? text;
     PlannedAction? action;
 
     for (final part in parts) {
       if (part['text'] != null) {
-        message = (message ?? '') + (part['text'] as String);
+        text = (text ?? '') + (part['text'] as String);
       } else if (part['functionCall'] != null && action == null) {
         final call = part['functionCall'] as Map<String, dynamic>;
         action = PlannedAction(
           toolName: call['name'] as String,
           input: Map<String, dynamic>.from(call['args'] as Map? ?? {}),
+          callId: call['id'] as String?,
         );
       }
     }
 
-    return (action: action, message: message);
+    return GeminiTurn(text: text, action: action);
   }
 }
