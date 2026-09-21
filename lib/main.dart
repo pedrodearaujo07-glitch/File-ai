@@ -21,6 +21,14 @@ class VoiceFileAiApp extends StatelessWidget {
   }
 }
 
+enum ChatSender { user, assistant, system }
+
+class ChatMessage {
+  final ChatSender sender;
+  final String text;
+  ChatMessage(this.sender, this.text);
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -30,25 +38,30 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final stt.SpeechToText _speech = stt.SpeechToText();
-  final List<String> _log = [];
+  final List<ChatMessage> _messages = [];
   final TextEditingController _textController = TextEditingController();
 
+  GeminiService? _gemini;
   String? _folderUri;
   List<FileEntry> _folderListing = [];
   bool _isListening = false;
   bool _isBusy = false;
   String _transcript = '';
 
-  void _addLog(String line) {
-    setState(() => _log.insert(0, line));
+  void _addMessage(ChatSender sender, String text) {
+    setState(() => _messages.insert(0, ChatMessage(sender, text)));
   }
 
   Future<void> _pickFolder() async {
     final uri = await FileBridge.pickFolder();
     if (uri == null) return;
-    setState(() => _folderUri = uri);
+    setState(() {
+      _folderUri = uri;
+      _messages.clear();
+    });
+    _gemini?.resetConversation();
     await _refreshListing();
-    _addLog('📂 Pasta selecionada.');
+    _addMessage(ChatSender.system, '📂 Pasta selecionada. Conversa reiniciada.');
   }
 
   Future<void> _refreshListing() async {
@@ -57,17 +70,28 @@ class _HomePageState extends State<HomePage> {
     setState(() => _folderListing = listing);
   }
 
+  Future<GeminiService?> _ensureGemini() async {
+    if (_gemini != null) return _gemini;
+    final apiKey = await ApiKeyStore.get();
+    if (apiKey == null || apiKey.isEmpty) {
+      _addMessage(ChatSender.system, '⚠️ Configure sua chave do Gemini nas configurações (ícone no topo).');
+      return null;
+    }
+    _gemini = GeminiService(apiKey);
+    return _gemini;
+  }
+
   Future<void> _startListening() async {
     final micStatus = await Permission.microphone.request();
     if (!micStatus.isGranted) {
-      _addLog('⚠️ Permissão de microfone negada.');
+      _addMessage(ChatSender.system, '⚠️ Permissão de microfone negada.');
       return;
     }
     final available = await _speech.initialize(
-      onError: (e) => _addLog('⚠️ Erro no reconhecimento de voz: ${e.errorMsg}'),
+      onError: (e) => _addMessage(ChatSender.system, '⚠️ Erro no reconhecimento de voz: ${e.errorMsg}'),
     );
     if (!available) {
-      _addLog('⚠️ Reconhecimento de voz indisponível neste aparelho.');
+      _addMessage(ChatSender.system, '⚠️ Reconhecimento de voz indisponível neste aparelho.');
       return;
     }
     setState(() {
@@ -102,41 +126,55 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _runCommand(String command) async {
     if (_folderUri == null) {
-      _addLog('⚠️ Escolha uma pasta primeiro.');
+      _addMessage(ChatSender.system, '⚠️ Escolha uma pasta primeiro.');
       return;
     }
-    final apiKey = await ApiKeyStore.get();
-    if (apiKey == null || apiKey.isEmpty) {
-      _addLog('⚠️ Configure sua chave do Gemini nas configurações (ícone no topo).');
-      return;
-    }
+    final gemini = await _ensureGemini();
+    if (gemini == null) return;
 
+    _addMessage(ChatSender.user, command);
     setState(() => _isBusy = true);
-    _addLog('🎤 "$command"');
 
     try {
-      final service = GeminiService(apiKey);
-      final result = await service.interpretCommand(
-        transcript: command,
+      var turn = await gemini.sendUserMessage(
+        text: command,
         currentFolderUri: _folderUri!,
         currentFolderListing: _folderListing,
       );
 
-      if (result.action == null) {
-        _addLog('💬 ${result.message ?? "(sem resposta)"}');
-        return;
-      }
+      var chainGuard = 0;
+      while (true) {
+        if (turn.text != null && turn.text!.trim().isNotEmpty) {
+          _addMessage(ChatSender.assistant, turn.text!.trim());
+        }
 
-      final confirmed = await _confirmAction(result.action!);
-      if (!confirmed) {
-        _addLog('❌ Ação cancelada.');
-        return;
-      }
+        final action = turn.action;
+        if (action == null) break;
 
-      await _executeAction(result.action!);
-      await _refreshListing();
+        chainGuard++;
+        if (chainGuard > 4) {
+          _addMessage(ChatSender.system, '⚠️ Muitas ações em sequência — parando por segurança.');
+          break;
+        }
+
+        final confirmed = await _confirmAction(action);
+        var success = false;
+        if (confirmed) {
+          _addMessage(ChatSender.system, '⚙️ ${action.describe()}');
+          success = await _executeAction(action);
+          await _refreshListing();
+        }
+
+        turn = await gemini.reportActionResult(
+          action: action,
+          success: success,
+          cancelledByUser: !confirmed,
+          currentFolderUri: _folderUri!,
+          currentFolderListing: _folderListing,
+        );
+      }
     } catch (e) {
-      _addLog('⚠️ Erro: $e');
+      _addMessage(ChatSender.system, '⚠️ Erro: $e');
     } finally {
       setState(() => _isBusy = false);
     }
@@ -163,46 +201,35 @@ class _HomePageState extends State<HomePage> {
     return confirmed ?? false;
   }
 
-  Future<void> _executeAction(PlannedAction action) async {
+  Future<bool> _executeAction(PlannedAction action) async {
     final input = action.input;
     switch (action.toolName) {
       case 'move_file':
-        final ok = await FileBridge.moveFile(
+        return FileBridge.moveFile(
           sourceUri: input['source_uri'],
           destTreeUri: input['dest_folder_uri'],
         );
-        _addLog(ok ? '✅ Movido.' : '⚠️ Falha ao mover.');
-        break;
       case 'rename_file':
-        final ok = await FileBridge.renameFile(
-          uri: input['uri'],
-          newName: input['new_name'],
-        );
-        _addLog(ok ? '✅ Renomeado.' : '⚠️ Falha ao renomear.');
-        break;
+        return FileBridge.renameFile(uri: input['uri'], newName: input['new_name']);
       case 'delete_file':
-        final ok = await FileBridge.deleteFile(input['uri']);
-        _addLog(ok ? '✅ Apagado.' : '⚠️ Falha ao apagar.');
-        break;
+        return FileBridge.deleteFile(input['uri']);
       case 'read_file':
         final content = await FileBridge.readFile(input['uri']);
-        _addLog('📄 Conteúdo:\n${content ?? "(vazio ou ilegível)"}');
-        break;
+        if (content != null) {
+          _addMessage(ChatSender.system, '📄 $content');
+        }
+        return content != null;
       case 'write_file':
-        final ok = await FileBridge.writeFile(
-          uri: input['uri'],
-          content: input['content'],
-        );
-        _addLog(ok ? '✅ Arquivo atualizado.' : '⚠️ Falha ao editar.');
-        break;
+        return FileBridge.writeFile(uri: input['uri'], content: input['content']);
       case 'create_file':
         final newUri = await FileBridge.createFile(
           parentTreeUri: input['parent_uri'],
           name: input['name'],
           content: input['content'],
         );
-        _addLog(newUri != null ? '✅ Criado.' : '⚠️ Falha ao criar.');
-        break;
+        return newUri != null;
+      default:
+        return false;
     }
   }
 
@@ -226,6 +253,7 @@ class _HomePageState extends State<HomePage> {
           FilledButton(
             onPressed: () async {
               await ApiKeyStore.set(controller.text.trim());
+              _gemini = null; // força recriar com a nova chave
               if (context.mounted) Navigator.pop(context);
             },
             child: const Text('Salvar'),
@@ -239,6 +267,57 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _textController.dispose();
     super.dispose();
+  }
+
+  Widget _buildBubble(ChatMessage message) {
+    switch (message.sender) {
+      case ChatSender.user:
+        return Align(
+          alignment: Alignment.centerRight,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 280),
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.primary,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Text(
+              message.text,
+              style: TextStyle(color: Theme.of(context).colorScheme.onPrimary),
+            ),
+          ),
+        );
+      case ChatSender.assistant:
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 280),
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Text(message.text),
+          ),
+        );
+      case ChatSender.system:
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Center(
+            child: Text(
+              message.text,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12,
+                fontStyle: FontStyle.italic,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        );
+    }
   }
 
   @override
@@ -266,25 +345,23 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
           ),
-          if (_folderUri != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text('${_folderListing.length} itens nesta pasta'),
-              ),
-            ),
-          const Divider(),
+          const Divider(height: 1),
           Expanded(
-            child: ListView.builder(
-              reverse: true,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              itemCount: _log.length,
-              itemBuilder: (context, i) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Text(_log[i]),
-              ),
-            ),
+            child: _messages.isEmpty
+                ? Center(
+                    child: Text(
+                      _folderUri == null
+                          ? 'Escolha uma pasta e comece a conversar.'
+                          : 'Pode falar ou escrever um comando.',
+                      style: TextStyle(color: Theme.of(context).colorScheme.outline),
+                    ),
+                  )
+                : ListView.builder(
+                    reverse: true,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    itemCount: _messages.length,
+                    itemBuilder: (context, i) => _buildBubble(_messages[i]),
+                  ),
           ),
           if (_isListening)
             Padding(
@@ -301,7 +378,7 @@ class _HomePageState extends State<HomePage> {
                     controller: _textController,
                     enabled: !_isBusy,
                     decoration: const InputDecoration(
-                      hintText: 'Ou digite um comando...',
+                      hintText: 'Digite uma mensagem...',
                       border: OutlineInputBorder(),
                       isDense: true,
                     ),
@@ -319,12 +396,18 @@ class _HomePageState extends State<HomePage> {
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: FloatingActionButton.large(
-              onPressed: _isBusy
-                  ? null
-                  : (_isListening ? _stopListeningAndRun : _startListening),
-              backgroundColor: _isListening ? Colors.red : null,
-              child: Icon(_isListening ? Icons.stop : Icons.mic),
+            child: SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: _isBusy
+                    ? null
+                    : (_isListening ? _stopListeningAndRun : _startListening),
+                style: _isListening
+                    ? FilledButton.styleFrom(backgroundColor: Colors.red)
+                    : null,
+                icon: Icon(_isListening ? Icons.stop : Icons.mic),
+                label: Text(_isListening ? 'Parar' : 'Falar'),
+              ),
             ),
           ),
         ],
