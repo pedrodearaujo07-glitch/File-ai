@@ -51,6 +51,21 @@ class _HomePageState extends State<HomePage> {
   /// Segurança contra loop: máximo de ações encadeadas por comando.
   static const int _maxChainedActions = 12;
 
+  /// Extensões que a busca de conteúdo nem tenta abrir (não são texto).
+  static const Set<String> _nonSearchableExtensions = {
+    'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'ico',
+    'ogg', 'wav', 'mp3', 'flac', 'ttf', 'otf',
+    'zip', 'rar', '7z', 'jar', 'apk', 'aab',
+    'exe', 'so', 'dll', 'class',
+  };
+
+  static bool _isSearchable(String name) {
+    final dot = name.lastIndexOf('.');
+    if (dot == -1 || dot == name.length - 1) return true;
+    final ext = name.substring(dot + 1).toLowerCase();
+    return !_nonSearchableExtensions.contains(ext);
+  }
+
   void _addMessage(ChatSender sender, String text) {
     setState(() => _messages.insert(0, ChatMessage(sender, text)));
   }
@@ -276,6 +291,13 @@ class _HomePageState extends State<HomePage> {
       switch (action.toolName) {
         case 'list_folder':
           return await _listFolder(gemini, input['uri'], input['recursive'] == true);
+        case 'search_files':
+          return await _searchFiles(
+            gemini,
+            input['query'],
+            input['folder_uri'],
+            input['recursive'] == true,
+          );
         case 'move_file':
           return await _runBatch(
             input['items'],
@@ -423,6 +445,94 @@ class _HomePageState extends State<HomePage> {
       if (truncated)
         'aviso': 'Listagem cortada (limite de $maxEntries itens / $maxDepth níveis). '
             'Liste subpastas específicas para ver o resto.',
+    });
+  }
+
+  /// Procura um termo dentro do conteúdo dos arquivos de uma pasta (e, se
+  /// `recursive`, das subpastas). Pula extensões que claramente não são texto
+  /// (imagens, áudio...) sem sequer tentar abri-las.
+  Future<ActionOutcome> _searchFiles(
+    GeminiService gemini,
+    String query,
+    String rootUri,
+    bool recursive,
+  ) async {
+    const maxMatches = 30;
+    const maxFilesScanned = 500;
+    const maxDepth = 6;
+    const snippetRadius = 60;
+
+    final lowerQuery = query.toLowerCase();
+    final resultLines = <String>[];
+    var scanned = 0;
+    var truncated = false;
+
+    Future<void> walk(String folderUri, int depth) async {
+      if (truncated) return;
+      final entries = await FileBridge.listFiles(folderUri);
+      for (final e in entries) {
+        if (truncated) return;
+        if (e.isDirectory) {
+          if (recursive && depth + 1 < maxDepth) {
+            await walk(e.uri, depth + 1);
+          }
+          continue;
+        }
+        if (!_isSearchable(e.name)) continue;
+        if (scanned >= maxFilesScanned || resultLines.length >= maxMatches) {
+          truncated = true;
+          return;
+        }
+        scanned++;
+
+        String? content;
+        try {
+          content = await FileBridge.readFile(e.uri);
+        } catch (_) {
+          content = null;
+        }
+        if (content == null || content.contains('\u0000')) continue;
+
+        final lowerContent = content.toLowerCase();
+        final firstIdx = lowerContent.indexOf(lowerQuery);
+        if (firstIdx == -1) continue;
+
+        var count = 0;
+        var from = 0;
+        while (true) {
+          final found = lowerContent.indexOf(lowerQuery, from);
+          if (found == -1) break;
+          count++;
+          from = found + lowerQuery.length;
+        }
+
+        final start = (firstIdx - snippetRadius).clamp(0, content.length);
+        final end =
+            (firstIdx + lowerQuery.length + snippetRadius).clamp(0, content.length);
+        var snippet = content.substring(start, end).replaceAll('\n', ' ').trim();
+        if (start > 0) snippet = '…$snippet';
+        if (end < content.length) snippet = '$snippet…';
+
+        final id = gemini.idFor(e);
+        final vezes = count == 1 ? '1x' : '${count}x';
+        resultLines.add('[id $id] ${e.name} ($vezes): $snippet');
+      }
+    }
+
+    try {
+      await walk(rootUri, 0);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui concluir a busca: $e');
+    }
+
+    return ActionOutcome.ok({
+      'resultados': resultLines.isEmpty
+          ? 'Nenhum arquivo contém "$query".'
+          : resultLines.join('\n'),
+      if (truncated)
+        'aviso': 'Busca interrompida no limite de $maxFilesScanned arquivos '
+            'verificados ou $maxMatches resultados — refine o termo ou busque '
+            'numa subpasta específica.',
     });
   }
 
