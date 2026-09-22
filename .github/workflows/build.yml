@@ -30,15 +30,18 @@ jobs:
           sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.RECORD_AUDIO"\/>\n    <uses-permission android:name="android.permission.INTERNET"\/>#' android/app/src/main/AndroidManifest.xml
           grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
 
-      - name: Adicionar dependência androidx.documentfile
+      - name: Adicionar dependências nativas
         run: |
           cat >> android/app/build.gradle << 'EOF'
 
           dependencies {
               implementation 'androidx.documentfile:documentfile:1.0.1'
+              // Extrai texto de PDF (lib/gemini_service.dart -> read_file).
+              implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
           }
           EOF
           grep -q documentfile android/app/build.gradle
+          grep -q pdfbox-android android/app/build.gradle
 
       - name: flutter pub get
         run: flutter pub get
