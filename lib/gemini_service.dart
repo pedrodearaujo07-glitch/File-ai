@@ -23,10 +23,14 @@ class PlannedAction {
 
   /// Listar uma pasta só revela nomes (o mesmo que o modelo já vê da pasta
   /// principal), então roda sem pedir confirmação.
-  bool get needsConfirmation => toolName != 'list_folder';
+  bool get needsConfirmation =>
+      toolName != 'list_folder' && toolName != 'search_files';
 
   /// Ações que não alteram nada no armazenamento.
-  bool get isReadOnly => toolName == 'list_folder' || toolName == 'read_file';
+  bool get isReadOnly =>
+      toolName == 'list_folder' ||
+      toolName == 'read_file' ||
+      toolName == 'search_files';
 
   /// Itens de uma ação em lote (mover/apagar vários de uma vez).
   List<Map<String, dynamic>> get _items {
@@ -88,6 +92,11 @@ class PlannedAction {
         return 'Criar o arquivo "${input['name']}" em "${input['parent_name']}"';
       case 'read_file':
         return 'Ler "${input['name']}"';
+      case 'search_files':
+        {
+          final scope = input['recursive'] == false ? '' : ' e subpastas';
+          return 'Procurar "${input['query']}" em "${input['folder_name']}"$scope';
+        }
       default:
         return 'Ação desconhecida: $toolName';
     }
@@ -216,8 +225,15 @@ class GeminiService {
     final id = _register(entry);
     final kind = entry.isDirectory ? 'pasta' : 'arquivo';
     final indent = '  ' * depth;
-    return '$indent[id $id] [$kind] ${entry.name}';
+    final date = entry.modifiedDateLabel;
+    final dateSuffix = date == null ? '' : ' (modificado em $date)';
+    return '$indent[id $id] [$kind] ${entry.name}$dateSuffix';
   }
+
+  /// Garante que um item tenha um id (registrando-o na primeira vez que
+  /// aparece) e devolve esse id. Usado por ferramentas que descobrem
+  /// arquivos fora de uma listagem normal, como a busca de conteúdo.
+  int idFor(FileEntry entry) => _register(entry);
 
   static final List<Map<String, dynamic>> _functionDeclarations = [
     {
@@ -300,14 +316,42 @@ class GeminiService {
     {
       'name': 'read_file',
       'description':
-          'Lê o conteúdo de um arquivo de texto (não funciona em pastas nem em '
-              'arquivos binários como imagens).',
+          'Lê o conteúdo de um arquivo: texto simples, .pdf ou .docx (extrai o '
+              'texto automaticamente em ambos os casos). Não funciona em pastas '
+              'nem em outros arquivos binários (imagens, áudio, etc.).',
       'parameters': {
         'type': 'object',
         'properties': {
           'id': {'type': 'integer'},
         },
         'required': ['id'],
+      },
+    },
+    {
+      'name': 'search_files',
+      'description':
+          'Procura um termo dentro do conteúdo de arquivos de texto, .pdf e '
+              '.docx (não busca em imagens/áudio/binários). Devolve os arquivos '
+              'onde o termo aparece, com o número de ocorrências e um trecho de '
+              'contexto. Não precisa ler os arquivos um por um antes — use isso '
+              'direto quando o usuário quiser localizar algo pelo conteúdo.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'query': {
+            'type': 'string',
+            'description': 'termo a procurar (não diferencia maiúsculas/minúsculas)',
+          },
+          'folder_id': {
+            'type': 'integer',
+            'description': 'id da pasta onde procurar (0 = pasta principal)',
+          },
+          'recursive': {
+            'type': 'boolean',
+            'description': 'true (padrão) para procurar também nas subpastas',
+          },
+        },
+        'required': ['query'],
       },
     },
     {
@@ -380,7 +424,13 @@ class GeminiService {
         'recursive=true ele mostra tudo dentro da pasta de uma vez (list_folder '
         'com id 0 e recursive=true mostra a árvore inteira). Nunca opine sobre '
         'o conteúdo de uma pasta sem listá-la antes. Para ler um arquivo de '
-        'texto use read_file (não funciona em pastas). '
+        'texto use read_file (não funciona em pastas) — ele também extrai o '
+        'texto de arquivos .pdf e .docx automaticamente. Para localizar algo '
+        'pelo conteúdo (em vez de pelo nome), use search_files em vez de ler '
+        'arquivo por arquivo. Cada item mostra a data da última modificação; '
+        'não existe data de criação disponível nesse tipo de armazenamento do '
+        'Android, então nunca informe uma data de criação — se perguntarem, '
+        'diga que só a data de modificação está disponível. '
         'Para organizar arquivos em categorias, use create_folder para criar '
         'uma subpasta e depois move_file para mover os arquivos pra dentro dela. '
         'Se a listagem da pasta principal mudar de um pedido para o outro, é '
@@ -666,6 +716,29 @@ class GeminiService {
             toolName: tool,
             callId: callId,
             input: {'items': items},
+          );
+        }
+      case 'search_files':
+        {
+          final query = textArg('query')?.trim();
+          if (query == null || query.isEmpty) {
+            return invalid('Informe o termo a procurar no parâmetro query.');
+          }
+          final folderId = _asId(args['folder_id']) ?? 0;
+          final folder = _entriesById[folderId];
+          if (folder == null) return invalid(missing('folder_id'));
+          if (!folder.isDirectory) {
+            return invalid('"${folder.name}" não é uma pasta.');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {
+              'query': query,
+              'folder_uri': folder.uri,
+              'folder_name': folder.name,
+              'recursive': args['recursive'] != false,
+            },
           );
         }
       case 'write_file':
