@@ -4,22 +4,34 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Xml
 import androidx.documentfile.provider.DocumentFile
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.Result
+import org.xmlpull.v1.XmlPullParser
 import java.io.BufferedReader
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.util.zip.ZipInputStream
 
 class MainActivity : FlutterActivity() {
     private val channelName = "voice_file_ai/files"
     private val pickFolderRequestCode = 4201
     private var pendingPickResult: Result? = null
 
+    // Extração de texto de PDF exige inicializar o carregador de recursos do
+    // PDFBox uma vez antes do primeiro uso.
+    private val maxPdfPages = 500
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        PDFBoxResourceLoader.init(applicationContext)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -87,6 +99,9 @@ class MainActivity : FlutterActivity() {
                 "uri" to f.uri.toString(),
                 "name" to (f.name ?: "(sem nome)"),
                 "isDirectory" to f.isDirectory,
+                // O Android (SAF) só guarda a data de última modificação — não
+                // existe uma coluna de "data de criação" nesse tipo de provider.
+                "lastModified" to f.lastModified(),
             )
         }
         result.success(entries)
@@ -150,13 +165,77 @@ class MainActivity : FlutterActivity() {
     private fun readFile(uriStr: String, result: Result) {
         try {
             val uri = Uri.parse(uriStr)
-            val text = contentResolver.openInputStream(uri)?.use { input ->
-                BufferedReader(InputStreamReader(input)).readText()
+            val name = DocumentFile.fromSingleUri(this, uri)?.name ?: ""
+            val text = when {
+                name.endsWith(".pdf", ignoreCase = true) -> readPdfText(uri)
+                name.endsWith(".docx", ignoreCase = true) -> readDocxText(uri)
+                else -> contentResolver.openInputStream(uri)?.use { input ->
+                    BufferedReader(InputStreamReader(input)).readText()
+                }
             }
             result.success(text)
         } catch (e: Exception) {
             result.error("READ_FAILED", e.message, null)
         }
+    }
+
+    /// Extrai o texto de um PDF com o PDFBox-Android. Limita a quantidade de
+    /// páginas processadas como proteção contra PDFs enormes.
+    private fun readPdfText(uri: Uri): String {
+        val input = contentResolver.openInputStream(uri)
+            ?: throw Exception("Não consegui abrir o arquivo.")
+        input.use { stream ->
+            PDDocument.load(stream).use { document ->
+                val stripper = PDFTextStripper()
+                if (document.numberOfPages > maxPdfPages) {
+                    stripper.endPage = maxPdfPages
+                }
+                return stripper.getText(document)
+            }
+        }
+    }
+
+    /// Um .docx é um zip com o texto em word/document.xml. Em vez de trazer
+    /// uma biblioteca inteira de Word (pesada e problemática no Android), lê
+    /// esse XML diretamente: cada <w:p> vira uma quebra de linha, <w:t> é o
+    /// texto de fato, e <w:tab>/<w:br> viram tabulação/quebra de linha.
+    private fun readDocxText(uri: Uri): String {
+        val input = contentResolver.openInputStream(uri)
+            ?: throw Exception("Não consegui abrir o arquivo.")
+        input.use { stream ->
+            ZipInputStream(stream).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    if (entry.name == "word/document.xml") {
+                        return extractTextFromDocumentXml(zip)
+                    }
+                    entry = zip.nextEntry
+                }
+            }
+        }
+        throw Exception("Não encontrei texto dentro do .docx (o arquivo pode estar corrompido).")
+    }
+
+    private fun extractTextFromDocumentXml(input: InputStream): String {
+        val parser = Xml.newPullParser()
+        parser.setInput(input, "UTF-8")
+        val sb = StringBuilder()
+        var insideText = false
+        var event = parser.eventType
+        while (event != XmlPullParser.END_DOCUMENT) {
+            when (event) {
+                XmlPullParser.START_TAG -> when (parser.name) {
+                    "w:p" -> if (sb.isNotEmpty()) sb.append('\n')
+                    "w:tab" -> sb.append('\t')
+                    "w:br", "w:cr" -> sb.append('\n')
+                    "w:t" -> insideText = true
+                }
+                XmlPullParser.TEXT -> if (insideText) sb.append(parser.text)
+                XmlPullParser.END_TAG -> if (parser.name == "w:t") insideText = false
+            }
+            event = parser.next()
+        }
+        return sb.toString()
     }
 
     private fun writeFile(uriStr: String, content: String, result: Result) {
