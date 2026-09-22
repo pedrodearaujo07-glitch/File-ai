@@ -6,14 +6,33 @@ class FileEntry {
   final String name;
   final bool isDirectory;
 
-  FileEntry({required this.uri, required this.name, required this.isDirectory});
+  /// Última modificação, em milissegundos desde 1970 (0 se desconhecida).
+  /// O Android (SAF) não guarda uma data de criação separada — só a de
+  /// última modificação — então é só isso que dá pra mostrar.
+  final int lastModified;
+
+  FileEntry({
+    required this.uri,
+    required this.name,
+    required this.isDirectory,
+    this.lastModified = 0,
+  });
 
   factory FileEntry.fromMap(Map<dynamic, dynamic> map) {
     return FileEntry(
       uri: map['uri'] as String,
       name: map['name'] as String,
       isDirectory: map['isDirectory'] as bool,
+      lastModified: (map['lastModified'] as num?)?.toInt() ?? 0,
     );
+  }
+
+  /// Data da última modificação no formato AAAA-MM-DD, ou null se não tiver.
+  String? get modifiedDateLabel {
+    if (lastModified <= 0) return null;
+    final d = DateTime.fromMillisecondsSinceEpoch(lastModified);
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${d.year}-${two(d.month)}-${two(d.day)}';
   }
 
   @override
