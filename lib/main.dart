@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -29,7 +31,11 @@ enum ChatSender { user, assistant, system }
 class ChatMessage {
   final ChatSender sender;
   final String text;
-  ChatMessage(this.sender, this.text);
+  /// Quando presente, a bolha mostra essa imagem em vez de só texto
+  /// (usado por view_image). Nunca é persistido entre aberturas do app —
+  /// ver _saveSession.
+  final Uint8List? imageBytes;
+  ChatMessage(this.sender, this.text, {this.imageBytes});
 }
 
 class HomePage extends StatefulWidget {
@@ -492,6 +498,11 @@ class _HomePageState extends State<HomePage> {
             await FileBridge.renameFile(uri: input['uri'], newName: input['new_name']),
             'Não consegui renomear.',
           );
+        case 'batch_rename':
+          return await _runBatch(
+            input['items'],
+            (item) => FileBridge.renameFile(uri: item['uri'], newName: item['new_name']),
+          );
         case 'delete_file':
           return await _runBatch(
             input['items'],
@@ -499,12 +510,18 @@ class _HomePageState extends State<HomePage> {
           );
         case 'read_file':
           return await _readFile(input);
+        case 'view_image':
+          return await _viewImage(input['uri'], input['name']);
         case 'find_by_name':
           return await _findByName(gemini, input['term'], input['folder_uri']);
         case 'map_folder':
           return await _mapFolder(gemini, input['folder_uri']);
         case 'compare_with_backup':
           return await _compareWithBackup(input['zip_uri'], input['folder_uri']);
+        case 'list_known_folders':
+          return await _listKnownFolders(gemini);
+        case 'fetch_url':
+          return await _fetchUrl(input['url']);
         case 'write_file':
           return _fromBool(
             await FileBridge.writeFile(uri: input['uri'], content: input['content']),
@@ -528,6 +545,10 @@ class _HomePageState extends State<HomePage> {
             );
             return _fromBool(newUri != null, 'Não consegui criar o arquivo.');
           }
+        case 'create_zip':
+          return await _createZip(input);
+        case 'extract_zip':
+          return await _extractZip(input['zip_uri'], input['dest_folder_uri']);
         default:
           return ActionOutcome.fail('Ferramenta desconhecida: ${action.toolName}');
       }
@@ -549,7 +570,8 @@ class _HomePageState extends State<HomePage> {
     final failed = <String>[];
     for (final raw in items) {
       final item = Map<String, dynamic>.from(raw as Map);
-      final name = '${item['name']}';
+      // batch_rename usa old_name/new_name em vez de name.
+      final name = '${item['name'] ?? item['old_name'] ?? '?'}';
       try {
         if (await operation(item)) {
           done.add(name);
@@ -883,6 +905,130 @@ class _HomePageState extends State<HomePage> {
     return ActionOutcome.ok({'comparacao': summary});
   }
 
+  /// Lê os bytes de uma imagem e a exibe como uma mensagem na conversa. A IA
+  /// não recebe o conteúdo da imagem, só a confirmação de que foi mostrada.
+  Future<ActionOutcome> _viewImage(String uri, String name) async {
+    Uint8List? bytes;
+    try {
+      bytes = await FileBridge.readImageBytes(uri);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui abrir a imagem: $e');
+    }
+    if (bytes == null) return const ActionOutcome.fail('Não consegui abrir a imagem.');
+    setState(() {
+      _messages.insert(0, ChatMessage(ChatSender.system, '🖼️ $name', imageBytes: bytes));
+    });
+    final kb = (bytes.length / 1024).toStringAsFixed(0);
+    return ActionOutcome.ok({'exibido': 'Imagem "$name" (~${kb}KB) exibida ao usuário na tela.'});
+  }
+
+  /// Compacta os itens indicados num novo .zip.
+  Future<ActionOutcome> _createZip(Map<String, dynamic> input) async {
+    final items = (input['items'] as List).cast<Map>();
+    final itemUris = items.map((i) => '${i['uri']}').toList();
+    String? newUri;
+    try {
+      newUri = await FileBridge.createZip(
+        itemUris: itemUris,
+        destTreeUri: input['dest_folder_uri'],
+        name: input['name'],
+      );
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui criar o .zip: $e');
+    }
+    if (newUri == null) {
+      return const ActionOutcome.fail(
+          'Não consegui criar o .zip (talvez já exista algo com esse nome ali).');
+    }
+    return ActionOutcome.ok({'criado': 'Zip "${input['name']}" criado com ${items.length} item(ns).'});
+  }
+
+  /// Extrai todo o conteúdo de um .zip numa pasta de destino.
+  Future<ActionOutcome> _extractZip(String zipUri, String destFolderUri) async {
+    int count;
+    try {
+      count = await FileBridge.extractZip(zipUri: zipUri, destTreeUri: destFolderUri);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui extrair o .zip: $e');
+    }
+    if (count == 0) {
+      return const ActionOutcome.fail('Não consegui extrair nada desse .zip.');
+    }
+    return ActionOutcome.ok({'extraidos': '$count arquivo(s) extraído(s) com sucesso.'});
+  }
+
+  /// Lista todas as pastas às quais o usuário já deu acesso (não só a atual).
+  Future<ActionOutcome> _listKnownFolders(GeminiService gemini) async {
+    List<String> uris;
+    try {
+      uris = await FileBridge.listGrantedRoots();
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui listar as pastas conhecidas: $e');
+    }
+    if (uris.isEmpty) {
+      return const ActionOutcome.ok({'pastas': '(nenhuma)'});
+    }
+    final lines = uris.map((uri) {
+      final entry = FileEntry(
+        uri: uri,
+        name: GeminiService.rootNameFromUri(uri),
+        isDirectory: true,
+      );
+      return gemini.formatEntry(entry);
+    }).join('\n');
+    return ActionOutcome.ok({'pastas': lines});
+  }
+
+  /// Busca uma página da internet e devolve o texto dela (HTML já "limpo").
+  Future<ActionOutcome> _fetchUrl(String url) async {
+    const maxBytes = 400000; // ~400KB brutos antes de extrair o texto
+    const maxChars = 15000; // depois de extrair, corta pro modelo não afogar
+    try {
+      final response = await http
+          .get(Uri.parse(url), headers: {'User-Agent': 'Mozilla/5.0 (VoiceFileAI)'})
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return ActionOutcome.fail('A página respondeu com erro ${response.statusCode}.');
+      }
+      final bytes = response.bodyBytes;
+      final raw = utf8.decode(
+        bytes.length > maxBytes ? bytes.sublist(0, maxBytes) : bytes,
+        allowMalformed: true,
+      );
+      final text = _htmlToText(raw);
+      final preview = text.length > 400 ? '${text.substring(0, 400)}…' : text;
+      _addMessage(ChatSender.system, '🌐 $preview');
+      final truncated = text.length > maxChars;
+      return ActionOutcome.ok({
+        'conteudo': truncated ? text.substring(0, maxChars) : text,
+        if (truncated) 'aviso': 'Página cortada nos primeiros $maxChars caracteres.',
+      });
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui buscar essa página: $e');
+    }
+  }
+
+  /// Extração bem simples de texto de HTML: tira <script>/<style> inteiros,
+  /// depois qualquer outra tag, decodifica entidades comuns e colapsa espaços.
+  String _htmlToText(String html) {
+    var text = html.replaceAll(
+        RegExp(r'<script[^>]*>.*?</script>', caseSensitive: false, dotAll: true), ' ');
+    text = text.replaceAll(
+        RegExp(r'<style[^>]*>.*?</style>', caseSensitive: false, dotAll: true), ' ');
+    text = text.replaceAll(RegExp(r'<[^>]+>'), ' ');
+    text = text
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'");
+    return text
+        .replaceAll(RegExp(r'[ \t]+'), ' ')
+        .replaceAll(RegExp(r'\n\s*\n+'), '\n\n')
+        .trim();
+  }
+
   Future<void> _openSettings() async {
     final controller = TextEditingController(text: await ApiKeyStore.get() ?? '');
     if (!mounted) return;
@@ -953,6 +1099,34 @@ class _HomePageState extends State<HomePage> {
           ),
         );
       case ChatSender.system:
+        if (message.imageBytes != null) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: Center(
+              child: Column(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 260, maxHeight: 260),
+                      child: Image.memory(message.imageBytes!, fit: BoxFit.contain),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    message.text,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontStyle: FontStyle.italic,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Center(
@@ -1084,5 +1258,3 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
-
- 
