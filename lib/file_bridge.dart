@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/services.dart';
 
 /// Representa um item (arquivo ou pasta) dentro da árvore escolhida pelo usuário.
@@ -168,5 +170,48 @@ class FileBridge {
       {'zipUri': zipUri, 'currentTreeUri': currentTreeUri},
     );
     return result;
+  }
+
+  /// Lê os bytes de uma imagem (.jpg, .png, etc.) pra exibir na tela.
+  static Future<Uint8List?> readImageBytes(String uri) async {
+    final result = await _channel.invokeMethod<Uint8List>('readImageBytes', {
+      'uri': uri,
+    });
+    return result;
+  }
+
+  /// Compacta uma lista de arquivos/pastas (de qualquer pasta já autorizada,
+  /// não só a atual) num novo .zip dentro da pasta de destino.
+  static Future<String?> createZip({
+    required List<String> itemUris,
+    required String destTreeUri,
+    required String name,
+  }) async {
+    final result = await _channel.invokeMethod<String>('createZip', {
+      'itemUris': itemUris,
+      'destTreeUri': destTreeUri,
+      'name': name,
+    });
+    return result;
+  }
+
+  /// Extrai todo o conteúdo de um .zip dentro de uma pasta de destino.
+  /// Retorna quantos arquivos foram extraídos.
+  static Future<int> extractZip({
+    required String zipUri,
+    required String destTreeUri,
+  }) async {
+    final result = await _channel.invokeMethod<int>('extractZip', {
+      'zipUri': zipUri,
+      'destTreeUri': destTreeUri,
+    });
+    return result ?? 0;
+  }
+
+  /// Todas as pastas às quais o usuário já deu acesso, em qualquer momento
+  /// (não só a pasta principal atual) — o Android lembra disso sozinho.
+  static Future<List<String>> listGrantedRoots() async {
+    final result = await _channel.invokeListMethod<String>('listGrantedRoots');
+    return result ?? [];
   }
 }
