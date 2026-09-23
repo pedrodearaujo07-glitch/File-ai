@@ -1,5 +1,8 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import 'api_key_store.dart';
@@ -48,6 +51,13 @@ class _HomePageState extends State<HomePage> {
   bool _isBusy = false;
   String _transcript = '';
 
+  /// Pra só avisar uma vez que a conversa está "pesada", não a cada mensagem.
+  bool _highStressWarned = false;
+
+  /// Chave usada pra guardar a sessão (conversa + pasta) no armazenamento do
+  /// próprio app, pra não perder tudo quando o app é fechado.
+  static const _sessionPrefsKey = 'voice_file_ai_session_v1';
+
   /// Segurança contra loop: máximo de ações encadeadas por comando.
   static const int _maxChainedActions = 12;
 
@@ -64,6 +74,83 @@ class _HomePageState extends State<HomePage> {
     if (dot == -1 || dot == name.length - 1) return true;
     final ext = name.substring(dot + 1).toLowerCase();
     return !_nonSearchableExtensions.contains(ext);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreSession();
+  }
+
+  /// Guarda a conversa atual (histórico da IA + mensagens + pasta) no
+  /// armazenamento do próprio app, pra continuar de onde parou da próxima
+  /// vez que o app for aberto — fechar o app não deve "resetar a IA".
+  Future<void> _saveSession() async {
+    if (_gemini == null || _folderUri == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final data = {
+        'folderUri': _folderUri,
+        'messages':
+            _messages.map((m) => {'sender': m.sender.name, 'text': m.text}).toList(),
+        'gemini': _gemini!.exportSession(),
+      };
+      await prefs.setString(_sessionPrefsKey, jsonEncode(data));
+    } catch (_) {
+      // Salvar a sessão é conveniência, não algo crítico — se falhar, a
+      // conversa continua funcionando normalmente só que sem persistir.
+    }
+  }
+
+  /// Tenta retomar a sessão salva ao abrir o app. Se não houver nada salvo,
+  /// ou algo estiver corrompido/incompatível, simplesmente começa vazio —
+  /// nunca trava o app por causa disso.
+  Future<void> _restoreSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_sessionPrefsKey);
+      if (raw == null) return;
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+
+      final folderUri = data['folderUri'] as String?;
+      if (folderUri == null) return;
+
+      final apiKey = await ApiKeyStore.get();
+      if (apiKey == null || apiKey.isEmpty) return;
+
+      final gemini = GeminiService(apiKey)
+        ..onStatus = (message) => _addMessage(ChatSender.system, message);
+      final geminiData = data['gemini'];
+      if (geminiData is Map) {
+        gemini.importSession(Map<String, dynamic>.from(geminiData));
+      }
+
+      final restoredMessages = <ChatMessage>[];
+      final rawMessages = data['messages'];
+      if (rawMessages is List) {
+        for (final raw in rawMessages) {
+          final map = Map<String, dynamic>.from(raw as Map);
+          final sender = ChatSender.values.firstWhere(
+            (s) => s.name == map['sender'],
+            orElse: () => ChatSender.system,
+          );
+          restoredMessages.add(ChatMessage(sender, map['text'] as String));
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _folderUri = folderUri;
+        _gemini = gemini;
+        _messages
+          ..clear()
+          ..addAll(restoredMessages);
+      });
+      await _refreshListing();
+    } catch (_) {
+      // Sessão salva corrompida ou de uma versão incompatível — ignora e
+      // começa do zero, em vez de travar a abertura do app.
+    }
   }
 
   void _addMessage(ChatSender sender, String text) {
@@ -85,43 +172,126 @@ class _HomePageState extends State<HomePage> {
           ? '📂 Pasta selecionada: "${GeminiService.rootNameFromUri(uri)}".'
           : '📂 Pasta principal alterada para "${GeminiService.rootNameFromUri(uri)}".',
     );
+    await _saveSession();
   }
 
   /// Apaga o histórico da conversa (a IA esquece o que foi dito), sem afetar
   /// os arquivos. Diferente de trocar de pasta, isso é sempre uma escolha
-  /// explícita do usuário.
+  /// explícita do usuário. Antes de limpar, recomenda salvar um backup da
+  /// conversa na pasta principal, pra não perder nada importante.
   Future<void> _startNewConversation() async {
     if (_messages.isEmpty) return;
-    final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('Começar conversa nova?'),
-            content: const Text(
-                'A IA vai esquecer tudo que foi conversado até agora. Os '
-                'arquivos não são afetados.'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancelar'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                child: const Text('Começar de novo'),
-              ),
-            ],
+    final stressLabel = _gemini?.stress.label;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Limpar conversa'),
+        content: Text(
+          'A IA vai esquecer tudo que foi conversado até agora'
+          '${stressLabel == null ? '' : ' ($stressLabel)'}. Os arquivos não '
+          'são afetados.\n\nRecomendado: salvar um backup da conversa na '
+          'pasta principal antes de limpar.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'cancel'),
+            child: const Text('Cancelar'),
           ),
-        ) ??
-        false;
-    if (!confirmed) return;
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'clear'),
+            child: const Text('Limpar sem backup'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, 'backup'),
+            child: const Text('Fazer backup e limpar'),
+          ),
+        ],
+      ),
+    );
+    if (choice == null || choice == 'cancel') return;
+
+    if (choice == 'backup') {
+      final ok = await _backupSession();
+      if (!ok) return; // o erro já foi avisado dentro de _backupSession
+    }
+
     _gemini?.resetConversation();
-    setState(() => _messages.clear());
+    setState(() {
+      _messages.clear();
+      _highStressWarned = false;
+    });
     _addMessage(ChatSender.system, '🔄 Conversa reiniciada.');
+    await _saveSession();
+  }
+
+  /// Salva um resumo legível da conversa atual como um .txt na pasta
+  /// principal — os "dados essenciais da sessão" que o usuário pediria de
+  /// volta se precisasse, antes de limpar o histórico.
+  Future<bool> _backupSession() async {
+    if (_folderUri == null) {
+      _addMessage(ChatSender.system, '⚠️ Escolha uma pasta antes de fazer backup.');
+      return false;
+    }
+    final now = DateTime.now();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final name = 'backup_conversa_${now.year}${two(now.month)}${two(now.day)}_'
+        '${two(now.hour)}${two(now.minute)}.txt';
+    final uri = await FileBridge.createFile(
+      parentTreeUri: _folderUri!,
+      name: name,
+      content: _buildSessionBackupText(),
+    );
+    if (uri == null) {
+      _addMessage(ChatSender.system, '⚠️ Não consegui salvar o backup.');
+      return false;
+    }
+    await _refreshListing();
+    _addMessage(ChatSender.system, '💾 Backup salvo como "$name".');
+    return true;
+  }
+
+  String _senderLabel(ChatSender sender) {
+    switch (sender) {
+      case ChatSender.user:
+        return 'Você';
+      case ChatSender.assistant:
+        return 'IA';
+      case ChatSender.system:
+        return 'Sistema';
+    }
+  }
+
+  String _buildSessionBackupText() {
+    final buffer = StringBuffer()
+      ..writeln('Backup da conversa — Voice File AI')
+      ..writeln(
+          'Pasta: ${_folderUri == null ? '-' : GeminiService.rootNameFromUri(_folderUri!)}')
+      ..writeln('Gerado em: ${DateTime.now()}')
+      ..writeln('---');
+    // _messages fica do mais novo pro mais antigo; aqui inverte pra ficar
+    // em ordem cronológica, como uma conversa de verdade se lê.
+    for (final m in _messages.reversed) {
+      buffer.writeln('[${_senderLabel(m.sender)}] ${m.text}');
+    }
+    return buffer.toString();
   }
 
   Future<void> _refreshListing() async {
     if (_folderUri == null) return;
-    final listing = await FileBridge.listFiles(_folderUri!);
-    setState(() => _folderListing = listing);
+    try {
+      final listing = await FileBridge.listFiles(_folderUri!);
+      setState(() => _folderListing = listing);
+    } catch (_) {
+      _addMessage(
+        ChatSender.system,
+        '⚠️ Perdi o acesso à pasta principal (a permissão pode ter sido '
+        'revogada). Escolha a pasta de novo em "Trocar pasta".',
+      );
+      setState(() {
+        _folderUri = null;
+        _folderListing = [];
+      });
+    }
   }
 
   Future<GeminiService?> _ensureGemini() async {
@@ -257,6 +427,17 @@ class _HomePageState extends State<HomePage> {
       _addMessage(ChatSender.system, '⚠️ Erro: $message');
     } finally {
       setState(() => _isBusy = false);
+      final stress = _gemini?.stress;
+      if (stress != null && stress.isHigh && !_highStressWarned) {
+        _highStressWarned = true;
+        _addMessage(
+          ChatSender.system,
+          '💡 A conversa está grande (${stress.label}). Isso deixa as '
+          'respostas mais lentas e caras — toque em ↺ no topo pra limpar o '
+          'histórico quando quiser (ele vai sugerir um backup antes).',
+        );
+      }
+      await _saveSession();
     }
   }
 
@@ -317,7 +498,13 @@ class _HomePageState extends State<HomePage> {
             (item) => FileBridge.deleteFile(item['uri']),
           );
         case 'read_file':
-          return await _readFile(input['uri']);
+          return await _readFile(input);
+        case 'find_by_name':
+          return await _findByName(gemini, input['term'], input['folder_uri']);
+        case 'map_folder':
+          return await _mapFolder(gemini, input['folder_uri']);
+        case 'compare_with_backup':
+          return await _compareWithBackup(input['zip_uri'], input['folder_uri']);
         case 'write_file':
           return _fromBool(
             await FileBridge.writeFile(uri: input['uri'], content: input['content']),
@@ -384,9 +571,17 @@ class _HomePageState extends State<HomePage> {
 
   /// Lê um arquivo de texto e devolve o conteúdo pro modelo (limitado, pra não
   /// estourar o contexto). Arquivos binários (imagens, zips) são recusados.
-  Future<ActionOutcome> _readFile(String uri) async {
+  /// Se `input` tiver start_line/end_line ou start_page/end_page, lê só essa
+  /// faixa (arquivos grandes), sem carregar o arquivo inteiro.
+  Future<ActionOutcome> _readFile(Map<String, dynamic> input) async {
     const maxChars = 20000;
-    final content = await FileBridge.readFile(uri);
+    final content = await FileBridge.readFile(
+      input['uri'],
+      startLine: input['start_line'],
+      endLine: input['end_line'],
+      startPage: input['start_page'],
+      endPage: input['end_page'],
+    );
     if (content == null) {
       return const ActionOutcome.fail('Não consegui ler o arquivo.');
     }
@@ -536,6 +731,158 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// Procura, em toda a árvore a partir de `rootUri`, arquivos/pastas cujo
+  /// nome contenha `term` (sem diferenciar maiúsculas/minúsculas). Só olha
+  /// nomes — bem mais rápido que a busca de conteúdo.
+  Future<ActionOutcome> _findByName(
+    GeminiService gemini,
+    String term,
+    String rootUri,
+  ) async {
+    const maxMatches = 60;
+    const maxVisited = 2000;
+    const maxDepth = 8;
+    final lowerTerm = term.toLowerCase();
+    final matches = <String>[];
+    var visited = 0;
+    var truncated = false;
+
+    Future<void> walk(String folderUri, int depth) async {
+      if (truncated) return;
+      final entries = await FileBridge.listFiles(folderUri);
+      for (final e in entries) {
+        if (truncated) return;
+        visited++;
+        if (visited > maxVisited) {
+          truncated = true;
+          return;
+        }
+        if (e.name.toLowerCase().contains(lowerTerm)) {
+          if (matches.length >= maxMatches) {
+            truncated = true;
+            return;
+          }
+          matches.add(gemini.formatEntry(e));
+        }
+        if (e.isDirectory && depth + 1 < maxDepth) {
+          await walk(e.uri, depth + 1);
+        }
+      }
+    }
+
+    try {
+      await walk(rootUri, 0);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui concluir a busca: $e');
+    }
+
+    return ActionOutcome.ok({
+      'encontrados': matches.isEmpty
+          ? 'Nenhum arquivo ou pasta com "$term" no nome.'
+          : matches.join('\n'),
+      if (truncated)
+        'aviso': 'Busca por nome interrompida (limite de itens visitados ou '
+            'resultados). Refine o termo ou procure numa subpasta específica.',
+    });
+  }
+
+  /// Estrutura completa de uma pasta (recursiva), com destaque separado dos
+  /// arquivos modificados mais recentemente em toda a árvore.
+  Future<ActionOutcome> _mapFolder(GeminiService gemini, String uri) async {
+    const maxEntries = 600;
+    const maxDepth = 8;
+    const maxHighlights = 20;
+    final lines = <String>[];
+    final allFiles = <FileEntry>[];
+    var truncated = false;
+
+    Future<void> walk(String folderUri, int depth) async {
+      final entries = await FileBridge.listFiles(folderUri);
+      entries.sort((a, b) {
+        if (a.isDirectory != b.isDirectory) return a.isDirectory ? -1 : 1;
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
+      for (final e in entries) {
+        if (lines.length >= maxEntries) {
+          truncated = true;
+          return;
+        }
+        lines.add(gemini.formatEntry(e, depth: depth));
+        if (!e.isDirectory) allFiles.add(e);
+        if (e.isDirectory) {
+          if (depth + 1 >= maxDepth) {
+            truncated = true;
+          } else {
+            await walk(e.uri, depth + 1);
+            if (truncated && lines.length >= maxEntries) return;
+          }
+        }
+      }
+    }
+
+    try {
+      await walk(uri, 0);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui mapear a pasta: $e');
+    }
+
+    final recent = [...allFiles]
+      ..sort((a, b) => b.lastModified.compareTo(a.lastModified));
+    final highlights = recent.where((e) => e.lastModified > 0).take(maxHighlights).map((e) {
+      final id = gemini.idFor(e);
+      final date = e.modifiedDateLabel;
+      return '[id $id] ${e.name}${date == null ? '' : ' ($date)'}';
+    }).join('\n');
+
+    return ActionOutcome.ok({
+      'estrutura': lines.isEmpty ? '(pasta vazia)' : lines.join('\n'),
+      'modificados_recentemente': highlights.isEmpty ? '(sem datas disponíveis)' : highlights,
+      if (truncated)
+        'aviso': 'Mapa cortado (limite de $maxEntries itens / $maxDepth níveis). '
+            'Mapeie subpastas específicas para ver o resto.',
+    });
+  }
+
+  /// Compara os arquivos atuais de uma pasta com o conteúdo de um backup
+  /// .zip (por caminho, tamanho e conteúdo — não só pelo nome).
+  Future<ActionOutcome> _compareWithBackup(String zipUri, String folderUri) async {
+    Map<String, dynamic>? result;
+    try {
+      result = await FileBridge.compareWithZipBackup(
+        zipUri: zipUri,
+        currentTreeUri: folderUri,
+      );
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui comparar com o backup: $e');
+    }
+    if (result == null) {
+      return const ActionOutcome.fail('Não consegui comparar com o backup.');
+    }
+
+    final added = (result['added'] as List).cast<String>();
+    final removed = (result['removed'] as List).cast<String>();
+    final changed = (result['changed'] as List).cast<String>();
+    final unchanged = result['unchanged'] as int;
+
+    String section(String title, List<String> items) {
+      if (items.isEmpty) return '$title: nenhum';
+      const maxShown = 40;
+      final shown = items.take(maxShown).join('\n  ');
+      final extra =
+          items.length > maxShown ? '\n  … e mais ${items.length - maxShown}' : '';
+      return '$title (${items.length}):\n  $shown$extra';
+    }
+
+    final summary = [
+      section('Adicionados desde o backup', added),
+      section('Removidos desde o backup', removed),
+      section('Alterados desde o backup', changed),
+      'Sem mudanças: $unchanged arquivo(s)',
+    ].join('\n\n');
+
+    return ActionOutcome.ok({'comparacao': summary});
+  }
+
   Future<void> _openSettings() async {
     final controller = TextEditingController(text: await ApiKeyStore.get() ?? '');
     if (!mounted) return;
@@ -654,6 +1001,20 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           const Divider(height: 1),
+          if (_gemini != null && _messages.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Text(
+                  _gemini!.stress.label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Theme.of(context).colorScheme.outline,
+                  ),
+                ),
+              ),
+            ),
           Expanded(
             child: _messages.isEmpty
                 ? Center(
@@ -723,3 +1084,5 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
+
+ 
