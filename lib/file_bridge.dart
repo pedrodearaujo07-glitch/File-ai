@@ -96,9 +96,23 @@ class FileBridge {
     return result ?? false;
   }
 
-  static Future<String?> readFile(String uri) async {
+  /// Lê um arquivo. Sem argumentos extras, lê tudo (comportamento de sempre).
+  /// Pra arquivos grandes, dá pra pedir só uma faixa sem carregar o resto:
+  /// startLine/endLine em arquivos de texto simples, ou startPage/endPage em
+  /// PDFs (não se aplica a .docx).
+  static Future<String?> readFile(
+    String uri, {
+    int? startLine,
+    int? endLine,
+    int? startPage,
+    int? endPage,
+  }) async {
     final result = await _channel.invokeMethod<String>('readFile', {
       'uri': uri,
+      if (startLine != null) 'startLine': startLine,
+      if (endLine != null) 'endLine': endLine,
+      if (startPage != null) 'startPage': startPage,
+      if (endPage != null) 'endPage': endPage,
     });
     return result;
   }
@@ -139,6 +153,20 @@ class FileBridge {
       'name': name,
       'content': content,
     });
+    return result;
+  }
+
+  /// Compara os arquivos de uma pasta com o conteúdo de um backup .zip
+  /// (por caminho, tamanho e CRC32 — não só pelo nome). Retorna null se
+  /// algo der errado (zip inválido, pasta inacessível, etc.).
+  static Future<Map<String, dynamic>?> compareWithZipBackup({
+    required String zipUri,
+    required String currentTreeUri,
+  }) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>(
+      'compareWithZipBackup',
+      {'zipUri': zipUri, 'currentTreeUri': currentTreeUri},
+    );
     return result;
   }
 }
