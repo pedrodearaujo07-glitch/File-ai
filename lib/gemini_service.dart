@@ -23,14 +23,21 @@ class PlannedAction {
 
   /// Listar uma pasta só revela nomes (o mesmo que o modelo já vê da pasta
   /// principal), então roda sem pedir confirmação.
-  bool get needsConfirmation =>
-      toolName != 'list_folder' && toolName != 'search_files';
+  static const _readOnlyTools = {
+    'list_folder',
+    'read_file',
+    'search_files',
+    'find_by_name',
+    'map_folder',
+    'compare_with_backup',
+  };
+
+  /// Ações que só leem (listar, ler, procurar, mapear, comparar) rodam sem
+  /// pedir confirmação — só as que mudam algo no armazenamento perguntam.
+  bool get needsConfirmation => !_readOnlyTools.contains(toolName);
 
   /// Ações que não alteram nada no armazenamento.
-  bool get isReadOnly =>
-      toolName == 'list_folder' ||
-      toolName == 'read_file' ||
-      toolName == 'search_files';
+  bool get isReadOnly => _readOnlyTools.contains(toolName);
 
   /// Itens de uma ação em lote (mover/apagar vários de uma vez).
   List<Map<String, dynamic>> get _items {
@@ -97,6 +104,12 @@ class PlannedAction {
           final scope = input['recursive'] == false ? '' : ' e subpastas';
           return 'Procurar "${input['query']}" em "${input['folder_name']}"$scope';
         }
+      case 'find_by_name':
+        return 'Procurar arquivos com "${input['term']}" no nome, em "${input['folder_name']}"';
+      case 'map_folder':
+        return 'Mapear a estrutura de "${input['folder_name']}"';
+      case 'compare_with_backup':
+        return 'Comparar "${input['folder_name']}" com o backup "${input['zip_name']}"';
       default:
         return 'Ação desconhecida: $toolName';
     }
@@ -117,6 +130,31 @@ class ActionOutcome {
   /// `data` opcional: numa falha parcial (ex.: 3 de 5 arquivos apagados) leva
   /// a lista do que deu certo e do que falhou.
   const ActionOutcome.fail([this.error, this.data]) : success = false;
+}
+
+/// Uma "foto" de quão grande a conversa está — quantas trocas de mensagem e
+/// aproximadamente quantos caracteres de histórico estão sendo reenviados
+/// pro Gemini a cada pergunta nova. Não é o limite real do modelo (esse é
+/// enorme, na casa do milhão de tokens) — é só um alerta prático de custo e
+/// velocidade: conversas grandes deixam cada resposta mais lenta e cara.
+class SessionStress {
+  final int turns;
+  final int chars;
+  const SessionStress(this.turns, this.chars);
+
+  /// baixo / médio / alto — limiares aproximados, não uma medida exata.
+  String get level {
+    if (chars < 20000) return 'baixo';
+    if (chars < 60000) return 'médio';
+    return 'alto';
+  }
+
+  bool get isHigh => level == 'alto';
+
+  String get label {
+    final kb = (chars / 1024).toStringAsFixed(0);
+    return '$turns mensagens • ~${kb}KB de histórico • estresse $level';
+  }
 }
 
 /// O que o modelo devolveu num turno: uma fala (para mostrar no chat) e/ou
@@ -163,6 +201,66 @@ class GeminiService {
     _entriesById.clear();
     _idsByUri.clear();
     _nextId = 1;
+  }
+
+  /// Quão grande a conversa está agora — pra mostrar na tela e decidir se
+  /// vale a pena sugerir limpar o histórico.
+  SessionStress get stress =>
+      SessionStress(_history.length, jsonEncode(_history).length);
+
+  /// Estado necessário pra retomar a conversa depois de fechar e abrir o app
+  /// de novo (a chave de API fica de fora — isso é responsabilidade do
+  /// ApiKeyStore).
+  Map<String, dynamic> exportSession() {
+    return {
+      'history': _history,
+      'entries': _entriesById.entries
+          .map((e) => {
+                'id': e.key,
+                'uri': e.value.uri,
+                'name': e.value.name,
+                'isDirectory': e.value.isDirectory,
+                'lastModified': e.value.lastModified,
+              })
+          .toList(),
+      'nextId': _nextId,
+    };
+  }
+
+  /// Restaura uma sessão salva. Se algo estiver corrompido ou incompleto,
+  /// ignora silenciosamente em vez de travar o app com uma sessão pela metade.
+  void importSession(Map<String, dynamic> data) {
+    try {
+      final history = data['history'];
+      if (history is List) {
+        _history
+          ..clear()
+          ..addAll(history.map((e) => Map<String, dynamic>.from(e as Map)));
+      }
+      final entries = data['entries'];
+      if (entries is List) {
+        _entriesById.clear();
+        _idsByUri.clear();
+        for (final raw in entries) {
+          final e = Map<String, dynamic>.from(raw as Map);
+          final id = e['id'] as int;
+          final entry = FileEntry(
+            uri: e['uri'] as String,
+            name: e['name'] as String,
+            isDirectory: e['isDirectory'] as bool,
+            lastModified: (e['lastModified'] as num?)?.toInt() ?? 0,
+          );
+          _entriesById[id] = entry;
+          _idsByUri[entry.uri] = id;
+        }
+      }
+      final nextId = data['nextId'];
+      if (nextId is int) _nextId = nextId;
+    } catch (_) {
+      // Sessão salva corrompida/incompatível — melhor começar limpo do que
+      // travar o app tentando usar um estado quebrado.
+      resetConversation();
+    }
   }
 
   int _register(FileEntry entry) {
@@ -318,13 +416,97 @@ class GeminiService {
       'description':
           'Lê o conteúdo de um arquivo: texto simples, .pdf ou .docx (extrai o '
               'texto automaticamente em ambos os casos). Não funciona em pastas '
-              'nem em outros arquivos binários (imagens, áudio, etc.).',
+              'nem em outros arquivos binários (imagens, áudio, etc.). Para '
+              'arquivos grandes, dá pra ler só uma parte, sem carregar tudo: '
+              'start_line/end_line (texto simples) ou start_page/end_page '
+              '(.pdf). Sem faixa, lê do início (cortado em ~20 mil caracteres).',
       'parameters': {
         'type': 'object',
         'properties': {
           'id': {'type': 'integer'},
+          'start_line': {
+            'type': 'integer',
+            'description': 'primeira linha (1 = primeira) — só texto simples',
+          },
+          'end_line': {
+            'type': 'integer',
+            'description': 'última linha (inclusive) — só texto simples',
+          },
+          'start_page': {
+            'type': 'integer',
+            'description': 'primeira página (1 = primeira) — só .pdf',
+          },
+          'end_page': {
+            'type': 'integer',
+            'description': 'última página (inclusive) — só .pdf',
+          },
         },
         'required': ['id'],
+      },
+    },
+    {
+      'name': 'find_by_name',
+      'description':
+          'Procura arquivos ou pastas pelo nome (ou parte do nome) em toda a '
+              'árvore, recursivamente, sem precisar navegar manualmente pasta '
+              'por pasta. Bem mais rápido que list_folder recursivo quando você '
+              'já sabe (ao menos em parte) o nome do que está procurando — não '
+              'olha o conteúdo, só o nome (pra isso use search_files).',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'name_contains': {
+            'type': 'string',
+            'description': 'trecho do nome a procurar (não diferencia maiúsculas/minúsculas)',
+          },
+          'folder_id': {
+            'type': 'integer',
+            'description': 'id da pasta onde procurar (0 = pasta principal)',
+          },
+        },
+        'required': ['name_contains'],
+      },
+    },
+    {
+      'name': 'map_folder',
+      'description':
+          'Devolve uma visão geral de uma pasta e tudo dentro dela (estrutura '
+              'completa, recursiva), destacando em separado os arquivos '
+              'modificados mais recentemente. Bom para "o que mudou por aqui '
+              'ultimamente" ou pra entender a estrutura de um projeto de uma vez '
+              '— prefira isso a list_folder recursivo quando o pedido for sobre '
+              'visão geral ou mudanças recentes.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'folder_id': {
+            'type': 'integer',
+            'description': 'id da pasta a mapear (0 = pasta principal)',
+          },
+        },
+        'required': [],
+      },
+    },
+    {
+      'name': 'compare_with_backup',
+      'description':
+          'Compara os arquivos atuais de uma pasta com o conteúdo de um backup '
+              '.zip, mostrando o que foi adicionado, removido ou alterado desde '
+              'o backup (compara conteúdo de verdade, não só nome). Pode '
+              'demorar um pouco em pastas grandes.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'zip_id': {
+            'type': 'integer',
+            'description': 'id do arquivo .zip de backup (já precisa ter sido visto numa listagem/busca)',
+          },
+          'folder_id': {
+            'type': 'integer',
+            'description': 'id da pasta atual a comparar (0 = pasta principal)',
+          },
+        },
+        'required': ['zip_id'],
       },
     },
     {
@@ -427,7 +609,13 @@ class GeminiService {
         'texto use read_file (não funciona em pastas) — ele também extrai o '
         'texto de arquivos .pdf e .docx automaticamente. Para localizar algo '
         'pelo conteúdo (em vez de pelo nome), use search_files em vez de ler '
-        'arquivo por arquivo. Cada item mostra a data da última modificação; '
+        'arquivo por arquivo. Para achar um arquivo ou pasta pelo NOME (sem '
+        'navegar manualmente), use find_by_name em vez de list_folder '
+        'recursivo. Para uma visão geral de um projeto, com destaque pros '
+        'arquivos modificados recentemente, use map_folder. Pra comparar a '
+        'pasta atual com um backup .zip, use compare_with_backup (o zip '
+        'precisa ter aparecido antes numa listagem/busca, pra ter um id). '
+        'Cada item mostra a data da última modificação; '
         'não existe data de criação disponível nesse tipo de armazenamento do '
         'Android, então nunca informe uma data de criação — se perguntarem, '
         'diga que só a data de modificação está disponível. '
@@ -607,10 +795,91 @@ class GeminiService {
             return invalid(
                 '"${file.name}" é uma pasta, não dá pra ler como arquivo. Use list_folder.');
           }
+          int? intArg(String key) {
+            final v = args[key];
+            if (v is int) return v;
+            if (v is num) return v.toInt();
+            return null;
+          }
+
+          final startLine = intArg('start_line');
+          final endLine = intArg('end_line');
+          final startPage = intArg('start_page');
+          final endPage = intArg('end_page');
           return PlannedAction(
             toolName: tool,
             callId: callId,
-            input: {'uri': file.uri, 'name': file.name},
+            input: {
+              'uri': file.uri,
+              'name': file.name,
+              if (startLine != null) 'start_line': startLine,
+              if (endLine != null) 'end_line': endLine,
+              if (startPage != null) 'start_page': startPage,
+              if (endPage != null) 'end_page': endPage,
+            },
+          );
+        }
+      case 'find_by_name':
+        {
+          final term = textArg('name_contains')?.trim();
+          if (term == null || term.isEmpty) {
+            return invalid('Informe o trecho do nome no parâmetro name_contains.');
+          }
+          final folderId = _asId(args['folder_id']) ?? 0;
+          final folder = _entriesById[folderId];
+          if (folder == null) return invalid(missing('folder_id'));
+          if (!folder.isDirectory) {
+            return invalid('"${folder.name}" não é uma pasta.');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {
+              'term': term,
+              'folder_uri': folder.uri,
+              'folder_name': folder.name,
+            },
+          );
+        }
+      case 'map_folder':
+        {
+          final folderId = _asId(args['folder_id']) ?? 0;
+          final folder = _entriesById[folderId];
+          if (folder == null) return invalid(missing('folder_id'));
+          if (!folder.isDirectory) {
+            return invalid('"${folder.name}" não é uma pasta.');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {'folder_uri': folder.uri, 'folder_name': folder.name},
+          );
+        }
+      case 'compare_with_backup':
+        {
+          final zip = entryFor('zip_id');
+          if (zip == null) return invalid(missing('zip_id'));
+          if (zip.isDirectory) {
+            return invalid('"${zip.name}" é uma pasta, não um arquivo .zip.');
+          }
+          if (!zip.name.toLowerCase().endsWith('.zip')) {
+            return invalid('"${zip.name}" não parece ser um arquivo .zip.');
+          }
+          final folderId = _asId(args['folder_id']) ?? 0;
+          final folder = _entriesById[folderId];
+          if (folder == null) return invalid(missing('folder_id'));
+          if (!folder.isDirectory) {
+            return invalid('"${folder.name}" não é uma pasta.');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {
+              'zip_uri': zip.uri,
+              'zip_name': zip.name,
+              'folder_uri': folder.uri,
+              'folder_name': folder.name,
+            },
           );
         }
       case 'move_file':
@@ -945,3 +1214,5 @@ class GeminiService {
     return GeminiTurn(text: text, action: action);
   }
 }
+
+ 
