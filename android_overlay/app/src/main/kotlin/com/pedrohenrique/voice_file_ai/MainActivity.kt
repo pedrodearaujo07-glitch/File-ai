@@ -11,13 +11,18 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.Result
 import org.xmlpull.v1.XmlPullParser
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.util.zip.CRC32
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 
 class MainActivity : FlutterActivity() {
@@ -44,7 +49,7 @@ class MainActivity : FlutterActivity() {
                 )
                 "renameFile" -> renameFile(call.argument("uri")!!, call.argument("newName")!!, result)
                 "deleteFile" -> deleteFile(call.argument("uri")!!, result)
-                "readFile" -> readFile(call.argument("uri")!!, result)
+                "readFile" -> readFile(call, result)
                 "writeFile" -> writeFile(call.argument("uri")!!, call.argument("content")!!, result)
                 "createFolder" -> createFolder(
                     call.argument("parentTreeUri")!!,
@@ -55,6 +60,11 @@ class MainActivity : FlutterActivity() {
                     call.argument("parentTreeUri")!!,
                     call.argument("name")!!,
                     call.argument("content")!!,
+                    result,
+                )
+                "compareWithZipBackup" -> compareWithZipBackup(
+                    call.argument("zipUri")!!,
+                    call.argument("currentTreeUri")!!,
                     result,
                 )
                 else -> result.notImplemented()
@@ -162,16 +172,22 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun readFile(uriStr: String, result: Result) {
+    private fun readFile(call: MethodCall, result: Result) {
         try {
-            val uri = Uri.parse(uriStr)
+            val uri = Uri.parse(call.argument<String>("uri")!!)
             val name = DocumentFile.fromSingleUri(this, uri)?.name ?: ""
+            // Um "int" do Dart pode chegar aqui como Integer OU Long,
+            // dependendo do valor — lê como Number pra nunca dar
+            // ClassCastException, seja qual for o caso.
+            fun intArg(key: String): Int? = (call.argument<Any>(key) as? Number)?.toInt()
+            val startLine = intArg("startLine")
+            val endLine = intArg("endLine")
+            val startPage = intArg("startPage")
+            val endPage = intArg("endPage")
             val text = when {
-                name.endsWith(".pdf", ignoreCase = true) -> readPdfText(uri)
+                name.endsWith(".pdf", ignoreCase = true) -> readPdfText(uri, startPage, endPage)
                 name.endsWith(".docx", ignoreCase = true) -> readDocxText(uri)
-                else -> contentResolver.openInputStream(uri)?.use { input ->
-                    BufferedReader(InputStreamReader(input)).readText()
-                }
+                else -> readPlainText(uri, startLine, endLine)
             }
             result.success(text)
         } catch (e: Exception) {
@@ -179,17 +195,54 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /// Extrai o texto de um PDF com o PDFBox-Android. Limita a quantidade de
-    /// páginas processadas como proteção contra PDFs enormes.
-    private fun readPdfText(uri: Uri): String {
+    /// Lê um arquivo de texto simples. Sem faixa, lê tudo de uma vez (como
+    /// antes). Com startLine/endLine, lê linha por linha e para assim que
+    /// passa de endLine — nunca guarda o arquivo inteiro na memória de uma
+    /// vez, só o trecho pedido (importante pra arquivos muito grandes).
+    private fun readPlainText(uri: Uri, startLine: Int?, endLine: Int?): String {
+        val input = contentResolver.openInputStream(uri)
+            ?: throw Exception("Não consegui abrir o arquivo.")
+        input.use { stream ->
+            val reader = BufferedReader(InputStreamReader(stream))
+            if (startLine == null && endLine == null) {
+                return reader.readText()
+            }
+            val from = (startLine ?: 1).coerceAtLeast(1)
+            val to = endLine ?: Int.MAX_VALUE
+            val sb = StringBuilder()
+            var lineNumber = 0
+            var line = reader.readLine()
+            while (line != null) {
+                lineNumber++
+                if (lineNumber > to) break
+                if (lineNumber >= from) {
+                    if (sb.isNotEmpty()) sb.append('\n')
+                    sb.append(line)
+                }
+                line = reader.readLine()
+            }
+            return sb.toString()
+        }
+    }
+
+    /// Extrai o texto de um PDF com o PDFBox-Android. Sem faixa, processa só
+    /// as primeiras maxPdfPages páginas (proteção contra PDFs enormes). Com
+    /// startPage/endPage, processa só essa faixa (limitada ao mesmo teto),
+    /// sem precisar extrair o documento inteiro.
+    private fun readPdfText(uri: Uri, startPage: Int?, endPage: Int?): String {
         val input = contentResolver.openInputStream(uri)
             ?: throw Exception("Não consegui abrir o arquivo.")
         input.use { stream ->
             PDDocument.load(stream).use { document ->
-                val stripper = PDFTextStripper()
-                if (document.numberOfPages > maxPdfPages) {
-                    stripper.endPage = maxPdfPages
+                val total = document.numberOfPages
+                val from = (startPage ?: 1).coerceIn(1, total)
+                var to = (endPage ?: total).coerceIn(from, total)
+                if (to - from + 1 > maxPdfPages) {
+                    to = from + maxPdfPages - 1
                 }
+                val stripper = PDFTextStripper()
+                stripper.startPage = from
+                stripper.endPage = to
                 return stripper.getText(document)
             }
         }
@@ -276,6 +329,93 @@ class MainActivity : FlutterActivity() {
             result.success(newFile.uri.toString())
         } catch (e: Exception) {
             result.error("CREATE_FAILED", e.message, null)
+        }
+    }
+
+    /// Compara os arquivos atuais de uma pasta com o conteúdo de um backup
+    /// .zip, por caminho + tamanho + CRC32 (não só pelo nome — um arquivo do
+    /// mesmo tamanho mas conteúdo diferente também conta como alterado).
+    /// content:// não dá acesso aleatório, então copia o zip pra um arquivo
+    /// temporário no cache do app antes de abrir com ZipFile (mais confiável
+    /// que ZipInputStream, que só preenche crc/size depois de ler cada
+    /// entrada inteira).
+    private fun compareWithZipBackup(zipUriStr: String, currentTreeUriStr: String, result: Result) {
+        var tempFile: File? = null
+        try {
+            // Usa um val (não a var tempFile) nas operações de arquivo abaixo,
+            // pra nunca depender de smart-cast numa variável mutável — tempFile
+            // só existe pra garantir a limpeza no finally.
+            val tmp = File(cacheDir, "backup_compare_${System.currentTimeMillis()}.zip")
+            tempFile = tmp
+            contentResolver.openInputStream(Uri.parse(zipUriStr))?.use { input ->
+                FileOutputStream(tmp).use { output -> input.copyTo(output) }
+            } ?: throw Exception("Não consegui abrir o arquivo .zip.")
+
+            val zipEntries = mutableMapOf<String, Pair<Long, Long>>()
+            ZipFile(tmp).use { zf ->
+                for (e in zf.entries()) {
+                    if (!e.isDirectory) zipEntries[e.name] = Pair(e.size, e.crc)
+                }
+            }
+
+            val rootDoc = DocumentFile.fromTreeUri(this, Uri.parse(currentTreeUriStr))
+                ?: throw Exception("Não consegui abrir a pasta atual.")
+            val currentEntries = mutableMapOf<String, Pair<Long, Long>>()
+            collectCurrentFiles(rootDoc, "", currentEntries)
+
+            val added = mutableListOf<String>()
+            val removed = mutableListOf<String>()
+            val changed = mutableListOf<String>()
+            var unchanged = 0
+            val allPaths = zipEntries.keys + currentEntries.keys
+            for (path in allPaths) {
+                val inZip = zipEntries[path]
+                val inCurrent = currentEntries[path]
+                when {
+                    inZip == null -> added.add(path)
+                    inCurrent == null -> removed.add(path)
+                    inZip == inCurrent -> unchanged++
+                    else -> changed.add(path)
+                }
+            }
+            result.success(
+                mapOf(
+                    "added" to added.sorted(),
+                    "removed" to removed.sorted(),
+                    "changed" to changed.sorted(),
+                    "unchanged" to unchanged,
+                )
+            )
+        } catch (e: Exception) {
+            result.error("COMPARE_FAILED", e.message, null)
+        } finally {
+            tempFile?.delete()
+        }
+    }
+
+    /// Percorre a árvore atual calculando (tamanho, CRC32) de cada arquivo,
+    /// com o caminho relativo à raiz — pra comparar com as entradas do zip.
+    private fun collectCurrentFiles(
+        dir: DocumentFile,
+        prefix: String,
+        out: MutableMap<String, Pair<Long, Long>>,
+    ) {
+        for (f in dir.listFiles()) {
+            val path = if (prefix.isEmpty()) (f.name ?: "") else "$prefix/${f.name}"
+            if (f.isDirectory) {
+                collectCurrentFiles(f, path, out)
+                continue
+            }
+            val crc = CRC32()
+            contentResolver.openInputStream(f.uri)?.use { input ->
+                val buffer = ByteArray(8192)
+                var read = input.read(buffer)
+                while (read >= 0) {
+                    crc.update(buffer, 0, read)
+                    read = input.read(buffer)
+                }
+            }
+            out[path] = Pair(f.length(), crc.value)
         }
     }
 }
