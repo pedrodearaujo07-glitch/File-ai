@@ -2,6 +2,9 @@ package com.pedrohenrique.voice_file_ai
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Bundle
 import android.util.Xml
@@ -20,10 +23,13 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.io.OutputStream
 import java.io.OutputStreamWriter
 import java.util.zip.CRC32
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 class MainActivity : FlutterActivity() {
     private val channelName = "voice_file_ai/files"
@@ -33,6 +39,9 @@ class MainActivity : FlutterActivity() {
     // Extração de texto de PDF exige inicializar o carregador de recursos do
     // PDFBox uma vez antes do primeiro uso.
     private val maxPdfPages = 500
+
+    // Proteção contra OOM ao exibir uma imagem enorme.
+    private val maxImageBytes = 20L * 1024 * 1024
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -67,6 +76,19 @@ class MainActivity : FlutterActivity() {
                     call.argument("currentTreeUri")!!,
                     result,
                 )
+                "readImageBytes" -> readImageBytes(call.argument("uri")!!, result)
+                "createZip" -> createZip(
+                    call.argument("itemUris")!!,
+                    call.argument("destTreeUri")!!,
+                    call.argument("name")!!,
+                    result,
+                )
+                "extractZip" -> extractZip(
+                    call.argument("zipUri")!!,
+                    call.argument("destTreeUri")!!,
+                    result,
+                )
+                "listGrantedRoots" -> listGrantedRoots(result)
                 else -> result.notImplemented()
             }
         }
@@ -294,15 +316,122 @@ class MainActivity : FlutterActivity() {
     private fun writeFile(uriStr: String, content: String, result: Result) {
         try {
             val uri = Uri.parse(uriStr)
-            // "wt" trunca o arquivo antes de escrever, sobrescrevendo o conteúdo.
-            contentResolver.openOutputStream(uri, "wt")?.use { output ->
-                OutputStreamWriter(output).use { it.write(content) }
+            val name = DocumentFile.fromSingleUri(this, uri)?.name ?: ""
+            when {
+                name.endsWith(".pdf", ignoreCase = true) ->
+                    contentResolver.openOutputStream(uri, "wt")?.use { out -> writePdfPages(out, content) }
+                name.endsWith(".docx", ignoreCase = true) ->
+                    contentResolver.openOutputStream(uri, "wt")?.use { out -> writeDocxZip(out, content) }
+                else ->
+                    // "wt" trunca o arquivo antes de escrever, sobrescrevendo o conteúdo.
+                    contentResolver.openOutputStream(uri, "wt")?.use { output ->
+                        OutputStreamWriter(output).use { it.write(content) }
+                    }
             }
             result.success(true)
         } catch (e: Exception) {
             result.error("WRITE_FAILED", e.message, null)
         }
     }
+
+    /// Desenha o texto como páginas de PDF simples (uma fonte, sem imagens ou
+    /// tabelas) usando a API de PDF do próprio Android — sem precisar de uma
+    /// fonte customizada, ao contrário de escrever PDF pelo PDFBox.
+    private fun writePdfPages(output: OutputStream, content: String) {
+        val pageWidth = 595 // A4 em pontos, ~72dpi
+        val pageHeight = 842
+        val margin = 48f
+        val paint = Paint().apply {
+            textSize = 12f
+            color = Color.BLACK
+        }
+        val lineHeight = paint.textSize * 1.4f
+        val maxLinesPerPage = ((pageHeight - margin * 2) / lineHeight).toInt().coerceAtLeast(1)
+        val wrappedLines = wrapTextToLines(content, paint, pageWidth - margin * 2)
+
+        val pdf = PdfDocument()
+        var lineIndex = 0
+        var pageNumber = 1
+        do {
+            val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
+            val page = pdf.startPage(pageInfo)
+            var y = margin + paint.textSize
+            var linesOnPage = 0
+            while (lineIndex < wrappedLines.size && linesOnPage < maxLinesPerPage) {
+                page.canvas.drawText(wrappedLines[lineIndex], margin, y, paint)
+                y += lineHeight
+                lineIndex++
+                linesOnPage++
+            }
+            pdf.finishPage(page)
+            pageNumber++
+        } while (lineIndex < wrappedLines.size)
+        pdf.writeTo(output)
+        pdf.close()
+    }
+
+    /// Quebra o texto em linhas que cabem na largura disponível, respeitando
+    /// quebras de linha (\n) já existentes no texto.
+    private fun wrapTextToLines(text: String, paint: Paint, maxWidth: Float): List<String> {
+        val result = mutableListOf<String>()
+        for (paragraph in text.split("\n")) {
+            if (paragraph.isEmpty()) {
+                result.add("")
+                continue
+            }
+            var current = StringBuilder()
+            for (word in paragraph.split(" ")) {
+                val candidate = if (current.isEmpty()) word else "$current $word"
+                if (paint.measureText(candidate) > maxWidth && current.isNotEmpty()) {
+                    result.add(current.toString())
+                    current = StringBuilder(word)
+                } else {
+                    current = StringBuilder(candidate)
+                }
+            }
+            result.add(current.toString())
+        }
+        return result
+    }
+
+    /// Grava um .docx mínimo (só texto corrido, um parágrafo por linha) — os
+    /// três arquivos que todo leitor de OOXML espera encontrar num Word válido.
+    private fun writeDocxZip(output: OutputStream, content: String) {
+        ZipOutputStream(output).use { zip ->
+            zip.putNextEntry(ZipEntry("[Content_Types].xml"))
+            zip.write(docxContentTypesXml.toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("_rels/.rels"))
+            zip.write(docxRelsXml.toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("word/document.xml"))
+            zip.write(buildDocxDocumentXml(content).toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+        }
+    }
+
+    private fun buildDocxDocumentXml(content: String): String {
+        val sb = StringBuilder()
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>")
+        sb.append("<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">")
+        sb.append("<w:body>")
+        for (paragraph in content.split("\n")) {
+            sb.append("<w:p><w:r><w:t xml:space=\"preserve\">")
+            sb.append(escapeXml(paragraph))
+            sb.append("</w:t></w:r></w:p>")
+        }
+        sb.append("<w:sectPr/></w:body></w:document>")
+        return sb.toString()
+    }
+
+    private fun escapeXml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    private val docxContentTypesXml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"""
+
+    private val docxRelsXml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"""
 
     private fun createFolder(parentTreeUriStr: String, name: String, result: Result) {
         try {
@@ -315,16 +444,29 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /// Cria um arquivo novo. O formato é escolhido pela extensão do nome:
+    /// .pdf e .docx são gerados de verdade (texto simples, sem formatação
+    /// rica); qualquer outra extensão vira um arquivo de texto comum.
     private fun createFile(parentTreeUriStr: String, name: String, content: String, result: Result) {
         try {
             val parentDir = DocumentFile.fromTreeUri(this, Uri.parse(parentTreeUriStr))
-            val newFile = parentDir?.createFile("text/plain", name)
+            val mime = when {
+                name.endsWith(".pdf", ignoreCase = true) -> "application/pdf"
+                name.endsWith(".docx", ignoreCase = true) ->
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                else -> "text/plain"
+            }
+            val newFile = parentDir?.createFile(mime, name)
             if (newFile == null) {
                 result.success(null)
                 return
             }
             contentResolver.openOutputStream(newFile.uri)?.use { output ->
-                OutputStreamWriter(output).use { it.write(content) }
+                when {
+                    name.endsWith(".pdf", ignoreCase = true) -> writePdfPages(output, content)
+                    name.endsWith(".docx", ignoreCase = true) -> writeDocxZip(output, content)
+                    else -> OutputStreamWriter(output).use { it.write(content) }
+                }
             }
             result.success(newFile.uri.toString())
         } catch (e: Exception) {
@@ -416,6 +558,138 @@ class MainActivity : FlutterActivity() {
                 }
             }
             out[path] = Pair(f.length(), crc.value)
+        }
+    }
+
+    /// Lê os bytes de uma imagem pra exibir na tela do app (não a interpreta
+    /// de forma alguma — só entrega os bytes brutos pro Flutter desenhar).
+    private fun readImageBytes(uriStr: String, result: Result) {
+        try {
+            val uri = Uri.parse(uriStr)
+            val size = DocumentFile.fromSingleUri(this, uri)?.length() ?: -1
+            if (size > maxImageBytes) {
+                throw Exception(
+                    "Imagem grande demais pra exibir " +
+                        "(${size / 1024 / 1024}MB, limite ${maxImageBytes / 1024 / 1024}MB)."
+                )
+            }
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw Exception("Não consegui abrir a imagem.")
+            result.success(bytes)
+        } catch (e: Exception) {
+            result.error("READ_IMAGE_FAILED", e.message, null)
+        }
+    }
+
+    /// Compacta uma lista de arquivos/pastas (URIs, de qualquer árvore já
+    /// autorizada) num novo .zip dentro da pasta de destino.
+    private fun createZip(itemUris: List<String>, destTreeUriStr: String, name: String, result: Result) {
+        try {
+            val destDir = DocumentFile.fromTreeUri(this, Uri.parse(destTreeUriStr))
+                ?: throw Exception("Não consegui abrir a pasta de destino.")
+            val newFile = destDir.createFile("application/zip", name)
+                ?: throw Exception("Não consegui criar o arquivo .zip (nome já existe?).")
+            contentResolver.openOutputStream(newFile.uri)?.use { out ->
+                ZipOutputStream(out).use { zip ->
+                    for (uriStr in itemUris) {
+                        val doc = DocumentFile.fromTreeUri(this, Uri.parse(uriStr)) ?: continue
+                        addToZip(zip, doc, doc.name ?: "arquivo")
+                    }
+                }
+            }
+            result.success(newFile.uri.toString())
+        } catch (e: Exception) {
+            result.error("CREATE_ZIP_FAILED", e.message, null)
+        }
+    }
+
+    private fun addToZip(zip: ZipOutputStream, doc: DocumentFile, path: String) {
+        if (doc.isDirectory) {
+            for (child in doc.listFiles()) {
+                addToZip(zip, child, "$path/${child.name}")
+            }
+            return
+        }
+        zip.putNextEntry(ZipEntry(path))
+        contentResolver.openInputStream(doc.uri)?.use { input -> input.copyTo(zip) }
+        zip.closeEntry()
+    }
+
+    /// Extrai todo o conteúdo de um .zip dentro de uma pasta de destino,
+    /// recriando a estrutura de subpastas que o zip tiver.
+    private fun extractZip(zipUriStr: String, destTreeUriStr: String, result: Result) {
+        try {
+            val destDir = DocumentFile.fromTreeUri(this, Uri.parse(destTreeUriStr))
+                ?: throw Exception("Não consegui abrir a pasta de destino.")
+            val input = contentResolver.openInputStream(Uri.parse(zipUriStr))
+                ?: throw Exception("Não consegui abrir o .zip.")
+            var count = 0
+            input.use { stream ->
+                ZipInputStream(stream).use { zip ->
+                    var entry = zip.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory) {
+                            val target = ensurePath(destDir, entry.name)
+                            contentResolver.openOutputStream(target.uri, "wt")?.use { out ->
+                                zip.copyTo(out)
+                            }
+                            count++
+                        }
+                        entry = zip.nextEntry
+                    }
+                }
+            }
+            result.success(count)
+        } catch (e: Exception) {
+            result.error("EXTRACT_ZIP_FAILED", e.message, null)
+        }
+    }
+
+    /// Garante que as subpastas de um caminho tipo "a/b/c.txt" existam dentro
+    /// de `root`, criando o que faltar, e devolve (criando se preciso) o
+    /// arquivo final.
+    private fun ensurePath(root: DocumentFile, path: String): DocumentFile {
+        val parts = path.split("/").filter { it.isNotEmpty() }
+        var dir = root
+        for (i in 0 until parts.size - 1) {
+            val existing = dir.findFile(parts[i])
+            dir = if (existing != null && existing.isDirectory) {
+                existing
+            } else {
+                dir.createDirectory(parts[i])
+                    ?: throw Exception("Não consegui criar a subpasta ${parts[i]}.")
+            }
+        }
+        val fileName = parts.last()
+        val existingFile = dir.findFile(fileName)
+        if (existingFile != null) return existingFile
+        return dir.createFile(guessMimeType(fileName), fileName)
+            ?: throw Exception("Não consegui criar o arquivo $fileName.")
+    }
+
+    private fun guessMimeType(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "txt", "json", "mcmeta", "md", "lang" -> "text/plain"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "pdf" -> "application/pdf"
+            "zip" -> "application/zip"
+            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            else -> "application/octet-stream"
+        }
+    }
+
+    /// Todas as pastas às quais o usuário já deu acesso (não só a atual) —
+    /// o Android persiste essas permissões entre sessões automaticamente.
+    private fun listGrantedRoots(result: Result) {
+        try {
+            val uris = contentResolver.persistedUriPermissions
+                .filter { it.isReadPermission }
+                .map { it.uri.toString() }
+            result.success(uris)
+        } catch (e: Exception) {
+            result.error("LIST_ROOTS_FAILED", e.message, null)
         }
     }
 }
