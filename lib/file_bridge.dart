@@ -80,6 +80,19 @@ class FileBridge {
     return result ?? false;
   }
 
+  /// Copia um arquivo ou pasta (recursivamente) pra dentro de outra pasta,
+  /// SEM apagar a origem.
+  static Future<bool> copyItem({
+    required String sourceUri,
+    required String destTreeUri,
+  }) async {
+    final result = await _channel.invokeMethod<bool>('copyItem', {
+      'sourceUri': sourceUri,
+      'destTreeUri': destTreeUri,
+    });
+    return result ?? false;
+  }
+
   static Future<bool> renameFile({
     required String uri,
     required String newName,
@@ -213,5 +226,14 @@ class FileBridge {
   static Future<List<String>> listGrantedRoots() async {
     final result = await _channel.invokeListMethod<String>('listGrantedRoots');
     return result ?? [];
+  }
+
+  /// Abre a caixa de diálogo de impressão do Android pra um arquivo (texto,
+  /// .pdf, .docx ou imagem — outros formatos viram PDF antes de imprimir).
+  /// O usuário escolhe a impressora (Wi-Fi inclusive, se o telefone tiver um
+  /// serviço de impressão ativo) e confirma por lá.
+  static Future<bool> printFile(String uri) async {
+    final result = await _channel.invokeMethod<bool>('printFile', {'uri': uri});
+    return result ?? false;
   }
 }
