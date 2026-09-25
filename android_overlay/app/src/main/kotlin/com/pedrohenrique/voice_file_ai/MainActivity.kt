@@ -1,12 +1,23 @@
 package com.pedrohenrique.voice_file_ai
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
 import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.ParcelFileDescriptor
+import android.print.PageRange
+import android.print.PrintAttributes
+import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
+import android.print.PrintManager
 import android.util.Xml
 import androidx.documentfile.provider.DocumentFile
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -19,6 +30,7 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.Result
 import org.xmlpull.v1.XmlPullParser
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -40,8 +52,11 @@ class MainActivity : FlutterActivity() {
     // PDFBox uma vez antes do primeiro uso.
     private val maxPdfPages = 500
 
-    // Proteção contra OOM ao exibir uma imagem enorme.
-    private val maxImageBytes = 20L * 1024 * 1024
+    // Proteção contra OOM ao exibir e, principalmente, contra estourar o
+    // limite de 20MB por requisição da API do Gemini (a imagem vai em base64,
+    // ~33% maior que o arquivo original, então sobra margem pro resto do
+    // pedido — prompt, histórico da conversa etc.).
+    private val maxImageBytes = 8L * 1024 * 1024
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -52,6 +67,11 @@ class MainActivity : FlutterActivity() {
                 "pickFolder" -> pickFolder(result)
                 "listFiles" -> listFiles(call.argument("treeUri")!!, result)
                 "moveFile" -> moveFile(
+                    call.argument("sourceUri")!!,
+                    call.argument("destTreeUri")!!,
+                    result,
+                )
+                "copyItem" -> copyItem(
                     call.argument("sourceUri")!!,
                     call.argument("destTreeUri")!!,
                     result,
@@ -89,6 +109,7 @@ class MainActivity : FlutterActivity() {
                     result,
                 )
                 "listGrantedRoots" -> listGrantedRoots(result)
+                "printFile" -> printFile(call.argument("uri")!!, result)
                 else -> result.notImplemented()
             }
         }
@@ -141,38 +162,56 @@ class MainActivity : FlutterActivity() {
 
     private fun moveFile(sourceUriStr: String, destTreeUriStr: String, result: Result) {
         try {
-            val sourceUri = Uri.parse(sourceUriStr)
-            val destTreeUri = Uri.parse(destTreeUriStr)
-            val sourceFile = DocumentFile.fromSingleUri(this, sourceUri)
-            val destDir = DocumentFile.fromTreeUri(this, destTreeUri)
-
-            if (sourceFile == null || destDir == null) {
+            val source = DocumentFile.fromTreeUri(this, Uri.parse(sourceUriStr))
+            val destDir = DocumentFile.fromTreeUri(this, Uri.parse(destTreeUriStr))
+            if (source == null || destDir == null) {
                 result.success(false)
                 return
             }
-
-            // Copia o conteúdo para a pasta destino e depois apaga o original.
-            // (DocumentsContract.moveDocument só funciona quando ambos os
-            // documentos vêm do mesmo provider/árvore; copiar+apagar é mais
-            // confiável entre árvores diferentes.)
-            val newFile = destDir.createFile(
-                sourceFile.type ?: "application/octet-stream",
-                sourceFile.name ?: "arquivo",
-            ) ?: return result.success(false)
-
-            contentResolver.openInputStream(sourceUri).use { input ->
-                contentResolver.openOutputStream(newFile.uri).use { output ->
-                    if (input == null || output == null) {
-                        result.success(false)
-                        return
-                    }
-                    input.copyTo(output)
-                }
-            }
-            sourceFile.delete()
-            result.success(true)
+            // Copia (arquivo OU pasta inteira, recursivamente) pra pasta
+            // destino e só depois apaga a origem. (DocumentsContract.moveDocument
+            // só funciona quando os dois documentos vêm da mesma árvore; copiar
+            // + apagar é mais confiável entre árvores diferentes.)
+            copyRecursive(source, destDir)
+            result.success(source.delete())
         } catch (e: Exception) {
             result.error("MOVE_FAILED", e.message, null)
+        }
+    }
+
+    /// Copia um arquivo ou pasta (recursivamente) pra dentro de uma pasta de
+    /// destino, sem apagar a origem.
+    private fun copyItem(sourceUriStr: String, destTreeUriStr: String, result: Result) {
+        try {
+            val source = DocumentFile.fromTreeUri(this, Uri.parse(sourceUriStr))
+                ?: throw Exception("Não consegui abrir o item de origem.")
+            val destDir = DocumentFile.fromTreeUri(this, Uri.parse(destTreeUriStr))
+                ?: throw Exception("Não consegui abrir a pasta de destino.")
+            copyRecursive(source, destDir)
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("COPY_FAILED", e.message, null)
+        }
+    }
+
+    /// Copia `source` (arquivo ou pasta) pra dentro de `destParent`. Se for
+    /// pasta, recria a subpasta e copia tudo dentro dela também.
+    private fun copyRecursive(source: DocumentFile, destParent: DocumentFile) {
+        val name = source.name ?: "item"
+        if (source.isDirectory) {
+            val newDir = destParent.findFile(name)?.takeIf { it.isDirectory }
+                ?: destParent.createDirectory(name)
+                ?: throw Exception("Não consegui criar a subpasta $name.")
+            for (child in source.listFiles()) {
+                copyRecursive(child, newDir)
+            }
+            return
+        }
+        val mime = source.type ?: guessMimeType(name)
+        val newFile = destParent.createFile(mime, name)
+            ?: throw Exception("Não consegui criar o arquivo $name.")
+        contentResolver.openInputStream(source.uri)?.use { input ->
+            contentResolver.openOutputStream(newFile.uri)?.use { output -> input.copyTo(output) }
         }
     }
 
@@ -569,7 +608,7 @@ class MainActivity : FlutterActivity() {
             val size = DocumentFile.fromSingleUri(this, uri)?.length() ?: -1
             if (size > maxImageBytes) {
                 throw Exception(
-                    "Imagem grande demais pra exibir " +
+                    "Imagem grande demais pra exibir e enviar " +
                         "(${size / 1024 / 1024}MB, limite ${maxImageBytes / 1024 / 1024}MB)."
                 )
             }
@@ -691,5 +730,112 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             result.error("LIST_ROOTS_FAILED", e.message, null)
         }
+    }
+
+    /// Imprime um arquivo usando o Print Framework do Android, que abre a
+    /// caixa de diálogo padrão do sistema: lá o usuário escolhe a impressora
+    /// (inclusive impressoras na mesma rede Wi-Fi, se houver um serviço de
+    /// impressão ativo — ex.: "Serviço de impressão padrão" do Android) e
+    /// confirma. O app não fala com a impressora diretamente; quem cuida da
+    /// descoberta na rede e do envio é o próprio sistema.
+    private fun printFile(uriStr: String, result: Result) {
+        try {
+            val uri = Uri.parse(uriStr)
+            val name = DocumentFile.fromSingleUri(this, uri)?.name ?: "documento"
+            val ext = name.substringAfterLast('.', "").lowercase()
+
+            // O Android só sabe imprimir PDF/imagem nativamente — qualquer
+            // outro tipo (texto, .docx) vira um PDF primeiro, reaproveitando
+            // o mesmo gerador usado por create_file/write_file.
+            val pdfBytes: ByteArray = when (ext) {
+                "pdf" -> contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw Exception("Não consegui abrir o arquivo.")
+                "png", "jpg", "jpeg", "gif", "bmp", "webp" -> {
+                    val imageBytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw Exception("Não consegui abrir a imagem.")
+                    imageBytesToPdfBytes(imageBytes)
+                }
+                "docx" -> {
+                    val buffer = ByteArrayOutputStream()
+                    writePdfPages(buffer, readDocxText(uri))
+                    buffer.toByteArray()
+                }
+                else -> {
+                    val text = contentResolver.openInputStream(uri)?.use { input ->
+                        BufferedReader(InputStreamReader(input)).readText()
+                    } ?: ""
+                    val buffer = ByteArrayOutputStream()
+                    writePdfPages(buffer, text)
+                    buffer.toByteArray()
+                }
+            }
+
+            val printManager = getSystemService(Context.PRINT_SERVICE) as PrintManager
+            val adapter = object : PrintDocumentAdapter() {
+                override fun onLayout(
+                    oldAttributes: PrintAttributes?,
+                    newAttributes: PrintAttributes?,
+                    cancellationSignal: CancellationSignal?,
+                    callback: LayoutResultCallback?,
+                    extras: Bundle?,
+                ) {
+                    if (cancellationSignal?.isCanceled == true) {
+                        callback?.onLayoutCancelled()
+                        return
+                    }
+                    val info = PrintDocumentInfo.Builder(name)
+                        .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                        .build()
+                    callback?.onLayoutFinished(info, true)
+                }
+
+                override fun onWrite(
+                    pages: Array<out PageRange>?,
+                    destination: ParcelFileDescriptor?,
+                    cancellationSignal: CancellationSignal?,
+                    callback: WriteResultCallback?,
+                ) {
+                    try {
+                        FileOutputStream(destination?.fileDescriptor).use { out ->
+                            out.write(pdfBytes)
+                        }
+                        callback?.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                    } catch (e: Exception) {
+                        callback?.onWriteFailed(e.message)
+                    }
+                }
+            }
+            printManager.print(name, adapter, PrintAttributes.Builder().build())
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("PRINT_FAILED", e.message, null)
+        }
+    }
+
+    /// Desenha uma imagem numa única página de PDF (redimensionada pra caber),
+    /// pra poder imprimir imagens pelo mesmo caminho que documentos.
+    private fun imageBytesToPdfBytes(imageBytes: ByteArray): ByteArray {
+        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            ?: throw Exception("Não consegui abrir essa imagem.")
+        val pageWidth = 595
+        val pageHeight = 842
+        val margin = 24f
+        val pdf = PdfDocument()
+        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, 1).create()
+        val page = pdf.startPage(pageInfo)
+        val availableWidth = pageWidth - margin * 2
+        val availableHeight = pageHeight - margin * 2
+        val scale = minOf(availableWidth / bitmap.width, availableHeight / bitmap.height)
+        val drawWidth = bitmap.width * scale
+        val drawHeight = bitmap.height * scale
+        val left = (pageWidth - drawWidth) / 2f
+        val top = (pageHeight - drawHeight) / 2f
+        page.canvas.drawBitmap(bitmap, null, RectF(left, top, left + drawWidth, top + drawHeight), null)
+        pdf.finishPage(page)
+        val buffer = ByteArrayOutputStream()
+        pdf.writeTo(buffer)
+        pdf.close()
+        bitmap.recycle()
+        return buffer.toByteArray()
     }
 }
