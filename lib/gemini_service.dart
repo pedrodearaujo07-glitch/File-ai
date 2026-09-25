@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'file_bridge.dart';
 
@@ -73,9 +74,22 @@ class PlannedAction {
           final items = _items;
           final dest = input['dest_folder_name'];
           if (items.length == 1) {
-            return 'Mover "${items.first['name']}" para "$dest"';
+            final item = items.first;
+            final label = item['is_directory'] == true ? 'a pasta' : 'o arquivo';
+            return 'Mover $label "${item['name']}" para "$dest"';
           }
-          return 'Mover ${items.length} arquivos para "$dest":\n${_bulkList()}';
+          return 'Mover ${items.length} itens para "$dest":\n${_bulkList()}';
+        }
+      case 'copy_file':
+        {
+          final items = _items;
+          final dest = input['dest_folder_name'];
+          if (items.length == 1) {
+            final item = items.first;
+            final label = item['is_directory'] == true ? 'a pasta' : 'o arquivo';
+            return 'Copiar $label "${item['name']}" para "$dest"';
+          }
+          return 'Copiar ${items.length} itens para "$dest":\n${_bulkList()}';
         }
       case 'rename_file':
         return 'Renomear "${input['old_name']}" para "${input['new_name']}"';
@@ -140,6 +154,8 @@ class PlannedAction {
         return 'Listar todas as pastas conhecidas';
       case 'fetch_url':
         return 'Buscar "${input['url']}" na internet';
+      case 'print_file':
+        return 'Abrir a impressão de "${input['name']}"';
       default:
         return 'Ação desconhecida: $toolName';
     }
@@ -153,13 +169,22 @@ class ActionOutcome {
   final Map<String, dynamic>? data;
   final String? error;
 
-  const ActionOutcome.ok([this.data])
+  /// Presentes só quando a ação foi view_image: os bytes vão junto na
+  /// próxima mensagem pro Gemini enxergar de verdade, não só saber que uma
+  /// imagem foi mostrada.
+  final Uint8List? imageBytes;
+  final String? imageMimeType;
+
+  const ActionOutcome.ok([this.data, this.imageBytes, this.imageMimeType])
       : success = true,
         error = null;
 
   /// `data` opcional: numa falha parcial (ex.: 3 de 5 arquivos apagados) leva
   /// a lista do que deu certo e do que falhou.
-  const ActionOutcome.fail([this.error, this.data]) : success = false;
+  const ActionOutcome.fail([this.error, this.data])
+      : success = false,
+        imageBytes = null,
+        imageMimeType = null;
 }
 
 /// Uma "foto" de quão grande a conversa está — quantas trocas de mensagem e
@@ -207,7 +232,11 @@ class GeminiTurn {
 /// recebem só o id. Copiar URIs enormes de volta é justamente onde o modelo
 /// errava (trocava maiúscula por minúscula e o Android negava o acesso).
 class GeminiService {
-  static const _model = 'gemini-3.1-flash-lite';
+  // Escolhido especificamente pela disponibilidade: modelos mais antigos da
+  // família Gemini (como o 3.1) tendem a sofrer mais com picos de erro 503
+  // "sobrecarregado", porque a Google prioriza capacidade pros modelos mais
+  // recentes. O 3.5 Flash-Lite é a geração atual equivalente.
+  static const _model = 'gemini-3.5-flash-lite';
   static const _endpoint =
       'https://generativelanguage.googleapis.com/v1beta/models/$_model:generateContent';
 
@@ -389,16 +418,39 @@ class GeminiService {
     {
       'name': 'move_file',
       'description':
-          'Move um ou vários arquivos (não pastas) para UMA pasta de destino, '
-              'com uma única confirmação do usuário. Para mover vários, passe '
-              'todos os ids de uma vez em source_ids.',
+          'Move um ou vários arquivos OU PASTAS INTEIRAS (recursivamente) '
+              'para um destino, com uma única confirmação do usuário. Para '
+              'mover vários de uma vez, passe todos os ids em source_ids. '
+              'Copia sem apagar a origem? Use copy_file.',
       'parameters': {
         'type': 'object',
         'properties': {
           'source_ids': {
             'type': 'array',
             'items': {'type': 'integer'},
-            'description': 'ids dos arquivos a mover',
+            'description': 'ids dos arquivos/pastas a mover',
+          },
+          'dest_folder_id': {
+            'type': 'integer',
+            'description': 'id da pasta de destino',
+          },
+        },
+        'required': ['source_ids', 'dest_folder_id'],
+      },
+    },
+    {
+      'name': 'copy_file',
+      'description':
+          'Copia um ou mais arquivos OU PASTAS INTEIRAS (recursivamente) para '
+              'outro lugar, SEM apagar a origem — os dois ficam existindo. '
+              'Para mover (apagando a origem), use move_file.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'source_ids': {
+            'type': 'array',
+            'items': {'type': 'integer'},
+            'description': 'ids dos arquivos/pastas a copiar',
           },
           'dest_folder_id': {
             'type': 'integer',
@@ -513,10 +565,10 @@ class GeminiService {
     {
       'name': 'view_image',
       'description':
-          'Exibe uma imagem (.jpg, .png, etc.) na tela para o usuário ver. A '
-              'IA não enxerga o conteúdo da imagem, só confirma que ela foi '
-              'mostrada — se precisar saber o que tem nela, pergunte ao '
-              'usuário.',
+          'Exibe uma imagem (.jpg, .png, etc.) na tela para o usuário ver, E '
+              'te mostra o conteúdo dela — depois de chamar isso, você '
+              'enxerga a imagem de verdade e pode descrever, comparar ou '
+              'analisar o que tem nela.',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -751,6 +803,24 @@ class GeminiService {
         'required': ['url'],
       },
     },
+    {
+      'name': 'print_file',
+      'description':
+          'Imprime um arquivo (texto, .pdf, .docx ou imagem — outros '
+              'formatos viram PDF antes de imprimir). Abre a caixa de '
+              'diálogo de impressão do Android, onde o usuário escolhe a '
+              'impressora (inclusive impressoras na mesma rede Wi-Fi, se o '
+              'telefone tiver um serviço de impressão ativo) e confirma — a '
+              'impressão em si sempre depende dessa confirmação final, o app '
+              'só abre a caixa de diálogo.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'id': {'type': 'integer'},
+        },
+        'required': ['id'],
+      },
+    },
   ];
 
   String _systemPrompt(String currentFolderUri, List<FileEntry> listing) {
@@ -789,9 +859,14 @@ class GeminiService {
         'vez de rename_file repetido. create_file e write_file também geram '
         '.pdf e .docx de verdade (só texto simples, sem formatação rica) '
         'quando o nome termina nessas extensões. Para ver uma imagem, use '
-        'view_image — isso só mostra a imagem na tela, você não enxerga o '
-        'conteúdo dela. Para juntar vários arquivos num .zip use create_zip, '
-        'e pra extrair um .zip use extract_zip. Além da pasta principal, o '
+        'view_image — depois de chamar isso você enxerga a imagem de '
+        'verdade e pode descrever, comparar ou analisar o que tem nela. '
+        'move_file e copy_file funcionam com arquivos OU pastas inteiras '
+        '(recursivamente) — a diferença é que copy_file mantém a origem e '
+        'move_file apaga. Para juntar vários arquivos num .zip use create_zip, '
+        'e pra extrair um .zip use extract_zip. Para imprimir, use print_file '
+        '— isso abre a caixa de diálogo do Android, o usuário ainda escolhe a '
+        'impressora e confirma por lá. Além da pasta principal, o '
         'usuário pode ter dado acesso a outras pastas em trocas anteriores — '
         'use list_known_folders sempre que o que for pedido não parecer estar '
         'na pasta principal, em vez de pedir pra ele trocar de pasta '
@@ -848,6 +923,8 @@ class GeminiService {
     required List<FileEntry> currentFolderListing,
     Map<String, dynamic>? data,
     String? error,
+    Uint8List? imageBytes,
+    String? imageMimeType,
   }) async {
     final Map<String, dynamic> responseBody;
     if (cancelledByUser) {
@@ -897,10 +974,35 @@ class GeminiService {
             'name': action.toolName,
             'response': responseBody,
           }
-        }
+        },
+        // A imagem vai como conteúdo de verdade (não só texto descrevendo
+        // que foi mostrada), na mesma mensagem da resposta da ferramenta —
+        // assim o Gemini enxerga de fato o que tem nela.
+        if (imageBytes != null)
+          {
+            'inlineData': {
+              'mimeType': imageMimeType ?? 'image/jpeg',
+              'data': base64Encode(imageBytes),
+            }
+          },
       ],
     });
-    return _callModel(currentFolderUri, currentFolderListing);
+    // Índice dessa mensagem, pra poder tirar a imagem dela depois que o
+    // modelo já tiver respondido — sem isso, os bytes da imagem seriam
+    // reenviados de novo em TODA mensagem futura da conversa (caro e lento).
+    final imageTurnIndex = imageBytes == null ? null : _history.length - 1;
+
+    final result = await _callModel(currentFolderUri, currentFolderListing);
+
+    if (imageTurnIndex != null && imageTurnIndex < _history.length) {
+      final entry = _history[imageTurnIndex];
+      final parts = (entry['parts'] as List)
+          .where((p) => !(p is Map && p.containsKey('inlineData')))
+          .toList();
+      _history[imageTurnIndex] = {...entry, 'parts': parts};
+    }
+
+    return result;
   }
 
   /// Traduz o pedido do modelo (com ids) numa ação com URIs reais. Se algo
@@ -1108,11 +1210,62 @@ class GeminiService {
             if (isRoot(entry)) {
               return invalid('A pasta principal não pode ser movida.');
             }
-            if (entry.isDirectory) {
-              return invalid(
-                  'Mover pastas inteiras ainda não é suportado ("${entry.name}" é uma pasta).');
+            if (entry.isDirectory &&
+                (dest.uri == entry.uri || dest.uri.startsWith('${entry.uri}%2F'))) {
+              return invalid('Não dá pra mover "${entry.name}" pra dentro dela mesma.');
             }
-            items.add({'uri': entry.uri, 'name': entry.name});
+            items.add({
+              'uri': entry.uri,
+              'name': entry.name,
+              'is_directory': entry.isDirectory,
+            });
+          }
+          if (unknown.isNotEmpty) {
+            return invalid('Estes ids não existem: ${unknown.join(', ')}. '
+                'Use somente ids que apareceram nas listagens.');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {
+              'items': items,
+              'dest_folder_uri': dest.uri,
+              'dest_folder_name': dest.name,
+            },
+          );
+        }
+      case 'copy_file':
+        {
+          final ids = idList('source_ids', 'source_id');
+          if (ids == null || ids.isEmpty) {
+            return invalid(
+                'Passe em source_ids a lista de ids (números) dos itens a copiar.');
+          }
+          if (ids.length > _maxBatch) {
+            return invalid('No máximo $_maxBatch itens por vez.');
+          }
+          final dest = entryFor('dest_folder_id');
+          if (dest == null) return invalid(missing('dest_folder_id'));
+          if (!dest.isDirectory) {
+            return invalid('O destino "${dest.name}" não é uma pasta.');
+          }
+          final items = <Map<String, dynamic>>[];
+          final unknown = <int>[];
+          for (final id in ids) {
+            final entry = _entriesById[id];
+            if (entry == null) {
+              unknown.add(id);
+              continue;
+            }
+            if (entry.isDirectory &&
+                (dest.uri == entry.uri || dest.uri.startsWith('${entry.uri}%2F'))) {
+              return invalid('Não dá pra copiar "${entry.name}" pra dentro dela mesma.');
+            }
+            items.add({
+              'uri': entry.uri,
+              'name': entry.name,
+              'is_directory': entry.isDirectory,
+            });
           }
           if (unknown.isNotEmpty) {
             return invalid('Estes ids não existem: ${unknown.join(', ')}. '
@@ -1409,21 +1562,37 @@ class GeminiService {
           }
           return PlannedAction(toolName: tool, callId: callId, input: {'url': url});
         }
+      case 'print_file':
+        {
+          final file = entryFor('id');
+          if (file == null) return invalid(missing('id'));
+          if (file.isDirectory) {
+            return invalid('"${file.name}" é uma pasta, não dá pra imprimir.');
+          }
+          return PlannedAction(
+            toolName: tool,
+            callId: callId,
+            input: {'uri': file.uri, 'name': file.name},
+          );
+        }
       default:
         return invalid('Ferramenta desconhecida: $tool');
     }
   }
 
-  /// Avisa o usuário de coisas como "tentando de novo..." (opcional).
+  /// Avisa o usuário de coisas como "tentando de novo..." (opcional). Usado
+  /// só pra status de retry — prefixo ⏳ marca isso pra tela atualizar a
+  /// última linha em vez de empilhar uma mensagem por tentativa.
   void Function(String message)? onStatus;
 
   // Erros temporários do lado do Google (sobrecarga, limite, instabilidade).
   static const _retryableStatus = {429, 500, 502, 503, 504};
   static const _retryDelays = [
     Duration(seconds: 2),
-    Duration(seconds: 5),
-    Duration(seconds: 10),
-    Duration(seconds: 20),
+    Duration(seconds: 4),
+    Duration(seconds: 8),
+    Duration(seconds: 15),
+    Duration(seconds: 25),
   ];
 
   /// Manda a requisição e, se o Gemini responder com um erro temporário
