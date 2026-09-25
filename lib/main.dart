@@ -125,7 +125,7 @@ class _HomePageState extends State<HomePage> {
       if (apiKey == null || apiKey.isEmpty) return;
 
       final gemini = GeminiService(apiKey)
-        ..onStatus = (message) => _addMessage(ChatSender.system, message);
+        ..onStatus = _updateRetryStatus;
       final geminiData = data['gemini'];
       if (geminiData is Map) {
         gemini.importSession(Map<String, dynamic>.from(geminiData));
@@ -161,6 +161,21 @@ class _HomePageState extends State<HomePage> {
 
   void _addMessage(ChatSender sender, String text) {
     setState(() => _messages.insert(0, ChatMessage(sender, text)));
+  }
+
+  /// Como _addMessage, mas se a mensagem mais recente também for um status
+  /// de nova tentativa (prefixo ⏳), substitui em vez de empilhar — sem isso,
+  /// um 503 demorado enche o chat com uma linha por tentativa.
+  void _updateRetryStatus(String text) {
+    setState(() {
+      if (_messages.isNotEmpty &&
+          _messages.first.sender == ChatSender.system &&
+          _messages.first.text.startsWith('⏳')) {
+        _messages[0] = ChatMessage(ChatSender.system, text);
+      } else {
+        _messages.insert(0, ChatMessage(ChatSender.system, text));
+      }
+    });
   }
 
   Future<void> _pickFolder() async {
@@ -308,7 +323,7 @@ class _HomePageState extends State<HomePage> {
       return null;
     }
     _gemini = GeminiService(apiKey)
-      ..onStatus = (message) => _addMessage(ChatSender.system, message);
+      ..onStatus = _updateRetryStatus;
     return _gemini;
   }
 
@@ -424,6 +439,8 @@ class _HomePageState extends State<HomePage> {
           cancelledByUser: !confirmed,
           data: outcome.data,
           error: outcome.error,
+          imageBytes: outcome.imageBytes,
+          imageMimeType: outcome.imageMimeType,
           currentFolderUri: _folderUri!,
           currentFolderListing: _folderListing,
         );
@@ -493,6 +510,14 @@ class _HomePageState extends State<HomePage> {
               destTreeUri: input['dest_folder_uri'],
             ),
           );
+        case 'copy_file':
+          return await _runBatch(
+            input['items'],
+            (item) => FileBridge.copyItem(
+              sourceUri: item['uri'],
+              destTreeUri: input['dest_folder_uri'],
+            ),
+          );
         case 'rename_file':
           return _fromBool(
             await FileBridge.renameFile(uri: input['uri'], newName: input['new_name']),
@@ -522,6 +547,8 @@ class _HomePageState extends State<HomePage> {
           return await _listKnownFolders(gemini);
         case 'fetch_url':
           return await _fetchUrl(input['url']);
+        case 'print_file':
+          return await _printFile(input['uri'], input['name']);
         case 'write_file':
           return _fromBool(
             await FileBridge.writeFile(uri: input['uri'], content: input['content']),
@@ -919,7 +946,31 @@ class _HomePageState extends State<HomePage> {
       _messages.insert(0, ChatMessage(ChatSender.system, '🖼️ $name', imageBytes: bytes));
     });
     final kb = (bytes.length / 1024).toStringAsFixed(0);
-    return ActionOutcome.ok({'exibido': 'Imagem "$name" (~${kb}KB) exibida ao usuário na tela.'});
+    return ActionOutcome.ok(
+      {'exibido': 'Imagem "$name" (~${kb}KB) exibida ao usuário e enviada pra você ver.'},
+      bytes,
+      _imageMimeType(name),
+    );
+  }
+
+  /// Mime type pela extensão — usado pra mandar a imagem certa pro Gemini.
+  String _imageMimeType(String name) {
+    final dot = name.lastIndexOf('.');
+    final ext = dot == -1 ? '' : name.substring(dot + 1).toLowerCase();
+    switch (ext) {
+      case 'png':
+        return 'image/png';
+      case 'gif':
+        return 'image/gif';
+      case 'webp':
+        return 'image/webp';
+      case 'bmp':
+        return 'image/bmp';
+      case 'jpg':
+      case 'jpeg':
+      default:
+        return 'image/jpeg';
+    }
   }
 
   /// Compacta os itens indicados num novo .zip.
@@ -1027,6 +1078,23 @@ class _HomePageState extends State<HomePage> {
         .replaceAll(RegExp(r'[ \t]+'), ' ')
         .replaceAll(RegExp(r'\n\s*\n+'), '\n\n')
         .trim();
+  }
+
+  /// Abre a caixa de diálogo de impressão do Android pro arquivo. A
+  /// confirmação de verdade (escolher impressora, tocar em "Imprimir")
+  /// acontece nessa caixa de diálogo do sistema, não aqui no app.
+  Future<ActionOutcome> _printFile(String uri, String name) async {
+    bool ok;
+    try {
+      ok = await FileBridge.printFile(uri);
+    } catch (e) {
+      return ActionOutcome.fail('Não consegui abrir a impressão: $e');
+    }
+    if (!ok) return const ActionOutcome.fail('Não consegui abrir a impressão.');
+    return ActionOutcome.ok({
+      'impressao': 'Caixa de diálogo de impressão de "$name" aberta — '
+          'escolha a impressora e confirme por lá.',
+    });
   }
 
   Future<void> _openSettings() async {
