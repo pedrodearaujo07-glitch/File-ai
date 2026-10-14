@@ -871,3 +871,31 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun startOverlayService(result: Result) {
+        try {
+            val intent = Intent(this, OverlayService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("START_OVERLAY_FAILED", e.message, null)
+        }
+    }
+
+    private fun stopOverlayService(result: Result) {
+        try {
+            // O serviço já está rodando (em foreground) — só entrega o
+            // pedido de parar, não precisa "iniciar" de novo.
+            val intent = Intent(this, OverlayService::class.java).apply {
+                action = OverlayService.ACTION_STOP
+            }
+            startService(intent)
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("STOP_OVERLAY_FAILED", e.message, null)
+        }
+    }
+}
