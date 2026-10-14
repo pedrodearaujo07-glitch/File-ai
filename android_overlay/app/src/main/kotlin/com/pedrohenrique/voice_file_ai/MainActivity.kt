@@ -10,6 +10,7 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
@@ -18,6 +19,7 @@ import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
 import android.print.PrintManager
+import android.provider.Settings
 import android.util.Xml
 import androidx.documentfile.provider.DocumentFile
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -110,6 +112,10 @@ class MainActivity : FlutterActivity() {
                 )
                 "listGrantedRoots" -> listGrantedRoots(result)
                 "printFile" -> printFile(call.argument("uri")!!, result)
+                "hasOverlayPermission" -> hasOverlayPermission(result)
+                "requestOverlayPermission" -> requestOverlayPermission(result)
+                "startOverlay" -> startOverlayService(result)
+                "stopOverlay" -> stopOverlayService(result)
                 else -> result.notImplemented()
             }
         }
@@ -838,4 +844,30 @@ class MainActivity : FlutterActivity() {
         bitmap.recycle()
         return buffer.toByteArray()
     }
-}
+
+    /// "Aparecer sobre outros apps" é uma permissão especial — não dá pra
+    /// pedir com o diálogo comum, só mandando o usuário pra uma tela do
+    /// Android (é ele quem concede, manualmente, por lá).
+    private fun hasOverlayPermission(result: Result) {
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(this)
+        } else {
+            true
+        }
+        result.success(granted)
+    }
+
+    private fun requestOverlayPermission(result: Result) {
+        try {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName"),
+            )
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            result.success(null)
+        } catch (e: Exception) {
+            result.error("OVERLAY_PERMISSION_FAILED", e.message, null)
+        }
+    }
+
