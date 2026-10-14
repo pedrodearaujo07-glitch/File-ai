@@ -27,8 +27,11 @@ jobs:
 
       - name: Adicionar permissões no AndroidManifest.xml
         run: |
-          sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.RECORD_AUDIO"\/>\n    <uses-permission android:name="android.permission.INTERNET"\/>#' android/app/src/main/AndroidManifest.xml
+          sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.RECORD_AUDIO"\/>\n    <uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"\/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"\/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"\/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"\/>#' android/app/src/main/AndroidManifest.xml
+          sed -i 's#</application>#        <service\n            android:name=".OverlayService"\n            android:enabled="true"\n            android:exported="false"\n            android:foregroundServiceType="specialUse">\n            <property\n                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"\n                android:value="floating_launcher_icon" \/>\n        <\/service>\n    </application>#' android/app/src/main/AndroidManifest.xml
           grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+          grep -q SYSTEM_ALERT_WINDOW android/app/src/main/AndroidManifest.xml
+          grep -q OverlayService android/app/src/main/AndroidManifest.xml
 
       - name: Adicionar dependências nativas
         run: |
