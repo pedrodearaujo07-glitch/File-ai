@@ -236,4 +236,30 @@ class FileBridge {
     final result = await _channel.invokeMethod<bool>('printFile', {'uri': uri});
     return result ?? false;
   }
+
+  /// "Aparecer sobre outros apps" — permissão especial, concedida manualmente
+  /// pelo usuário numa tela do próprio Android (não dá pra pedir via diálogo
+  /// comum).
+  static Future<bool> hasOverlayPermission() async {
+    final result = await _channel.invokeMethod<bool>('hasOverlayPermission');
+    return result ?? false;
+  }
+
+  /// Manda o usuário pra tela do Android onde ele concede (ou não) a
+  /// permissão de sobrepor outros apps.
+  static Future<void> requestOverlayPermission() async {
+    await _channel.invokeMethod('requestOverlayPermission');
+  }
+
+  /// Liga o ícone flutuante (exige a permissão acima já concedida).
+  static Future<bool> startOverlay() async {
+    final result = await _channel.invokeMethod<bool>('startOverlay');
+    return result ?? false;
+  }
+
+  /// Desliga o ícone flutuante.
+  static Future<bool> stopOverlay() async {
+    final result = await _channel.invokeMethod<bool>('stopOverlay');
+    return result ?? false;
+  }
 }
