@@ -64,6 +64,11 @@ class _HomePageState extends State<HomePage> {
   /// próprio app, pra não perder tudo quando o app é fechado.
   static const _sessionPrefsKey = 'voice_file_ai_session_v1';
 
+  /// Se o ícone flutuante estava ligado da última vez (pra religar sozinho
+  /// ao abrir o app de novo, sem precisar que o usuário toque de novo).
+  static const _floatingIconPrefKey = 'voice_file_ai_floating_icon_enabled';
+  bool _floatingIconEnabled = false;
+
   /// Segurança contra loop: máximo de ações encadeadas por comando.
   static const int _maxChainedActions = 12;
 
@@ -86,6 +91,59 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _restoreSession();
+    _restoreFloatingIcon();
+  }
+
+  /// Se o ícone flutuante estava ligado da última vez e a permissão ainda
+  /// vale, religa sozinho. Se a permissão foi revogada enquanto isso, só
+  /// desiste silenciosamente (não fica insistindo/pedindo de novo sozinho).
+  Future<void> _restoreFloatingIcon() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final wasEnabled = prefs.getBool(_floatingIconPrefKey) ?? false;
+      if (!wasEnabled) return;
+      final hasPermission = await FileBridge.hasOverlayPermission();
+      if (!hasPermission) return;
+      final started = await FileBridge.startOverlay();
+      if (mounted) setState(() => _floatingIconEnabled = started);
+    } catch (_) {
+      // Não é crítico — sem o ícone flutuante o app continua funcionando
+      // normalmente, só sem esse atalho.
+    }
+  }
+
+  /// Liga/desliga o ícone flutuante. Devolve o estado que realmente ficou
+  /// valendo — pode não ser o pedido, ex.: se a permissão ainda não foi dada.
+  Future<bool> _toggleFloatingIcon(bool enable) async {
+    final prefs = await SharedPreferences.getInstance();
+
+    if (!enable) {
+      await FileBridge.stopOverlay();
+      await prefs.setBool(_floatingIconPrefKey, false);
+      setState(() => _floatingIconEnabled = false);
+      return false;
+    }
+
+    final hasPermission = await FileBridge.hasOverlayPermission();
+    if (!hasPermission) {
+      await FileBridge.requestOverlayPermission();
+      _addMessage(
+        ChatSender.system,
+        '📱 Conceda a permissão "Aparecer sobre outros apps" pra este app e '
+        'ligue o ícone flutuante de novo nas configurações.',
+      );
+      await prefs.setBool(_floatingIconPrefKey, false);
+      return false;
+    }
+
+    // Android 13+: sem isso a notificação do serviço fica invisível (o
+    // ícone flutuante funciona igual, só a notificação que não aparece).
+    await Permission.notification.request();
+
+    final started = await FileBridge.startOverlay();
+    await prefs.setBool(_floatingIconPrefKey, started);
+    setState(() => _floatingIconEnabled = started);
+    return started;
   }
 
   /// Guarda a conversa atual (histórico da IA + mensagens + pasta) no
@@ -1099,30 +1157,58 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _openSettings() async {
     final controller = TextEditingController(text: await ApiKeyStore.get() ?? '');
+    var floatingIconOn = _floatingIconEnabled;
     if (!mounted) return;
     await showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Chave de API do Gemini'),
-        content: TextField(
-          controller: controller,
-          obscureText: true,
-          decoration: const InputDecoration(hintText: 'AIza...'),
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Configurações'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Chave de API do Gemini'),
+                const SizedBox(height: 4),
+                TextField(
+                  controller: controller,
+                  obscureText: true,
+                  decoration: const InputDecoration(hintText: 'AIza...'),
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Ícone flutuante'),
+                  subtitle: const Text(
+                    'Abre o chat de qualquer lugar do celular, mesmo com o '
+                    'app fechado. Exige a permissão "Aparecer sobre outros '
+                    'apps".',
+                  ),
+                  value: floatingIconOn,
+                  onChanged: (value) async {
+                    final applied = await _toggleFloatingIcon(value);
+                    setDialogState(() => floatingIconOn = applied);
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Fechar'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                await ApiKeyStore.set(controller.text.trim());
+                _gemini = null; // força recriar com a nova chave
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Salvar chave'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancelar'),
-          ),
-          FilledButton(
-            onPressed: () async {
-              await ApiKeyStore.set(controller.text.trim());
-              _gemini = null; // força recriar com a nova chave
-              if (context.mounted) Navigator.pop(context);
-            },
-            child: const Text('Salvar'),
-          ),
-        ],
       ),
     );
   }
